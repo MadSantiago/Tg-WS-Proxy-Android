@@ -21,6 +21,11 @@ pub const IP_FAIL_COOLDOWN_INITIAL: f64 = 30.0;
 pub const IP_FAIL_COOLDOWN_MAX: f64 = 3600.0;
 pub const IP_FAIL_COOLDOWN_MAX_SHIFT: u32 = 7;
 
+// Десктоп 1636903: после плохого handshake не рвать соединение сразу,
+// а вычитать до 64 КБ или до 10 с — зонду труднее опознать прокси.
+pub const BAD_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const BAD_HANDSHAKE_DRAIN_LIMIT: usize = 64 * 1024;
+
 // OnNetworkChanged — вызовы чаще этого интервала сливаются в один сброс.
 pub const NETWORK_CHANGE_DEBOUNCE: f64 = 1.5;
 pub const DC_FAIL_COOLDOWN: f64 = 60.0;

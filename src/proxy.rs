@@ -1376,6 +1376,13 @@ pub async fn bridge_ws<R, W>(
     let close_reason_up_c = close_reason_up.clone();
     let up_task = tokio::spawn(async move {
         let mut buf = vec![0u8; WS_BRIDGE_CHUNK_SIZE];
+        // Открытый текст для MsgSplitter: копия чанка между clt_dec и
+        // tg_enc вместо второго AES-CTR внутри splitter. Буфер переиспользуется.
+        let mut plain: Vec<u8> = if splitter.is_some() {
+            Vec::with_capacity(WS_BRIDGE_CHUNK_SIZE)
+        } else {
+            Vec::new()
+        };
         loop {
             let read_res = tokio::select! {
                 _ = cancel_token_up.cancelled() => break,
@@ -1421,11 +1428,15 @@ pub async fn bridge_ws<R, W>(
             *la_up.lock().await = std::time::Instant::now();
 
             clt_dec.xor(chunk);
+            if splitter.is_some() {
+                plain.clear();
+                plain.extend_from_slice(chunk);
+            }
             tg_enc.xor(chunk);
 
             let send_err = {
                 if let Some(sp) = splitter.as_mut() {
-                    let parts = sp.split(chunk);
+                    let parts = sp.split(chunk, &plain);
                     if parts.len() > 1 {
                         ws_up.send_batch(&parts).await.is_err()
                     } else if parts.len() == 1 {
@@ -2292,6 +2303,37 @@ pub async fn handle_client(
 
 /// Ядро обслуживания соединения: 64-байтный handshake → маршрут → bridge.
 /// Generic над транспортом (TcpStream-halves или FakeTLS-duplex-halves).
+/// _drain_bad_handshake из 1636903. Читает и выбрасывает входящие
+/// данные, пока не наберётся `limit` байт, не придёт EOF/ошибка или не
+/// истечёт `timeout`. Отмена (StopProxy) прерывает ожидание сразу.
+/// Возвращает число вычитанных байт.
+async fn drain_bad_handshake<R>(
+    reader: &mut R,
+    cancel: &CancellationToken,
+    limit: usize,
+    timeout: Duration,
+) -> usize
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut buf = [0u8; 4096];
+    let mut drained = 0usize;
+    let drain = async {
+        while drained < limit {
+            let want = buf.len().min(limit - drained);
+            match reader.read(&mut buf[..want]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained += n,
+            }
+        }
+    };
+    tokio::select! {
+        _ = cancel.cancelled() => {}
+        _ = tokio::time::timeout(timeout, drain) => {}
+    }
+    drained
+}
+
 async fn serve_core<R, W>(
     pools: &ProxyPools,
     mut conn_read: R,
@@ -2339,6 +2381,13 @@ async fn serve_core<R, W>(
     if !valid_proto(proto) {
         STATS.connections_bad.fetch_add(1, Ordering::Relaxed);
         lwarn!("[{}] bad handshake (wrong secret or proto)", label);
+        drain_bad_handshake(
+            &mut conn_read,
+            &cancel_token,
+            BAD_HANDSHAKE_DRAIN_LIMIT,
+            BAD_HANDSHAKE_DRAIN_TIMEOUT,
+        )
+        .await;
         return;
     }
 
@@ -2470,7 +2519,7 @@ async fn serve_core<R, W>(
         }
 
         if !use_pooled_direct {
-            let splitter = MsgSplitter::new(&relay_init, proto_int);
+            let splitter = MsgSplitter::new(proto_int);
             let ok = do_fallback(
                 pools,
                 conn_read,
@@ -2599,7 +2648,7 @@ async fn serve_core<R, W>(
             );
         }
 
-        let splitter_fb = MsgSplitter::new(&relay_init, proto_int);
+        let splitter_fb = MsgSplitter::new(proto_int);
         let ok = do_fallback(
             pools,
             conn_read,
@@ -2627,7 +2676,7 @@ async fn serve_core<R, W>(
     pools.ws.report_success(dc, is_media).await;
     STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
 
-    let splitter = MsgSplitter::new(&relay_init, proto_int);
+    let splitter = MsgSplitter::new(proto_int);
     if splitter.is_some() {
         ldebug!(
             "[{}] MsgSplitter activated for proto 0x{:08X}",
@@ -2656,7 +2705,7 @@ async fn serve_core<R, W>(
                     lwarn!(" DC{}{} заблокирован (302)", dc, m_tag);
                 }
                 lwarn!(" direct fallback DC{}{}", dc, m_tag);
-                let splitter_fb = MsgSplitter::new(&relay_init, proto_int);
+                let splitter_fb = MsgSplitter::new(proto_int);
                 do_fallback(
                     pools,
                     conn_read,
@@ -2681,7 +2730,7 @@ async fn serve_core<R, W>(
                     lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
                     rws.close().await;
                     lwarn!(" direct fallback DC{}{}", dc, m_tag);
-                    let splitter_fb = MsgSplitter::new(&relay_init, proto_int);
+                    let splitter_fb = MsgSplitter::new(proto_int);
                     do_fallback(
                         pools,
                         conn_read,
@@ -3756,5 +3805,250 @@ mod network_change_tests {
         assert!(IP_FAIL_UNTIL.read().contains_key(&seeded.ip));
         assert_eq!(calls.load(SeqCst), 0);
         cleanup(&seeded);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bridge_ws + MsgSplitter — перенос WsReencryptTest из tests/test_bridge.py
+// (десктоп 3c54c54).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod bridge_split_tests {
+    use super::*;
+
+    fn init() -> [u8; 64] {
+        let mut b = [0u8; 64];
+        rand::thread_rng().fill_bytes(&mut b);
+        b
+    }
+
+    fn encryptor(init: &[u8; 64]) -> TrackedStream {
+        let mut enc = new_aes_ctr(&init[8..40], &init[40..56]);
+        let mut skip = [0u8; 64];
+        enc.xor(&mut skip);
+        enc
+    }
+
+    fn abridged(payload: &[u8]) -> Vec<u8> {
+        let words = payload.len() / 4;
+        let mut v = if words < 0x7F {
+            vec![words as u8]
+        } else {
+            vec![0x7F, words as u8, (words >> 8) as u8, (words >> 16) as u8]
+        };
+        v.extend_from_slice(payload);
+        v
+    }
+
+    fn intermediate(payload: &[u8]) -> Vec<u8> {
+        let mut v = (payload.len() as u32).to_le_bytes().to_vec();
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Читает с серверного конца WS бинарные кадры клиента (с маской), пока
+    /// не придёт `total` байт полезной нагрузки, CLOSE или EOF.
+    async fn read_client_frames(mut peer: TcpStream, total: usize) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        loop {
+            if out.iter().map(Vec::len).sum::<usize>() >= total {
+                return out;
+            }
+            let mut hdr = [0u8; 2];
+            if peer.read_exact(&mut hdr).await.is_err() {
+                return out;
+            }
+            let opcode = hdr[0] & 0x0F;
+            let mut len = (hdr[1] & 0x7F) as u64;
+            if len == 126 {
+                let mut b = [0u8; 2];
+                peer.read_exact(&mut b).await.unwrap();
+                len = u16::from_be_bytes(b) as u64;
+            } else if len == 127 {
+                let mut b = [0u8; 8];
+                peer.read_exact(&mut b).await.unwrap();
+                len = u64::from_be_bytes(b);
+            }
+            let mut mask = [0u8; 4];
+            if hdr[1] & 0x80 != 0 {
+                peer.read_exact(&mut mask).await.unwrap();
+            }
+            let mut payload = vec![0u8; len as usize];
+            peer.read_exact(&mut payload).await.unwrap();
+            xor_mask_in_place(&mut payload, &mask);
+            match opcode {
+                crate::ws::OP_CLOSE => return out,
+                crate::ws::OP_BINARY => out.push(payload),
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_encrypted_packets_and_incomplete_tail() {
+        type Frame = fn(&[u8]) -> Vec<u8>;
+        let cases: [(u32, Frame); 3] = [
+            (0xEFEFEFEF, abridged),
+            (0xEEEEEEEE, intermediate),
+            (0xDDDDDDDD, intermediate),
+        ];
+        for (proto, frame) in cases {
+            let packets = vec![
+                frame(&[b'a'; 8]),
+                frame(&[b'b'; 16]),
+                frame(&vec![b'c'; 70000]),
+                frame(&[b'd'; 32])[..7].to_vec(),
+            ];
+            let (client_init, relay_init) = (init(), init());
+            let mut data = packets.concat();
+            encryptor(&client_init).xor(&mut data);
+
+            let (mut client, proxy_side) = tokio::io::duplex(1 << 20);
+            let (r, w) = tokio::io::split(proxy_side);
+            let (ws, peer) = test_ws_pair().await;
+            let frames = tokio::spawn(read_client_frames(peer, data.len()));
+            let cancel = CancellationToken::new();
+
+            client.write_all(&data).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let bridge = tokio::spawn(bridge_ws(
+                    r,
+                    w,
+                    ws,
+                    "framing-test".to_string(),
+                    2,
+                    false,
+                    MsgSplitter::new(proto),
+                    encryptor(&client_init),
+                    encryptor(&init()),
+                    encryptor(&relay_init),
+                    encryptor(&init()),
+                    cancel.clone(),
+            ));
+
+            let sent = tokio::time::timeout(Duration::from_secs(5), frames)
+                .await
+                .expect("all frames received")
+                .unwrap();
+            // Сессию завершаем токеном: после EOF клиента bridge_ws может
+            // ждать ответа Telegram до BRIDGE_READ_TIMEOUT.
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(5), bridge)
+                .await
+                .expect("bridge_ws finished")
+                .unwrap();
+            let mut decoder = encryptor(&relay_init);
+            let decoded: Vec<Vec<u8>> = sent
+                .into_iter()
+                .map(|mut part| {
+                    decoder.xor(&mut part);
+                    part
+                })
+                .collect();
+            assert_eq!(decoded, packets, "proto={:08X}", proto);
+            drop(client);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ограниченное чтение после плохого handshake
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod bad_handshake_drain_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stops_at_limit() {
+        let (mut client, mut proxy_side) = tokio::io::duplex(1 << 20);
+        client.write_all(&vec![0u8; 200 * 1024]).await.unwrap();
+        let n = drain_bad_handshake(
+            &mut proxy_side,
+            &CancellationToken::new(),
+            BAD_HANDSHAKE_DRAIN_LIMIT,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(n, BAD_HANDSHAKE_DRAIN_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn stops_at_eof() {
+        let (mut client, mut proxy_side) = tokio::io::duplex(1 << 16);
+        client.write_all(&[1u8; 1000]).await.unwrap();
+        drop(client);
+        let n = drain_bad_handshake(
+            &mut proxy_side,
+            &CancellationToken::new(),
+            BAD_HANDSHAKE_DRAIN_LIMIT,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(n, 1000);
+    }
+
+    #[tokio::test]
+    async fn stops_at_timeout_when_client_stays_silent() {
+        assert_eq!(BAD_HANDSHAKE_DRAIN_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(BAD_HANDSHAKE_DRAIN_LIMIT, 64 * 1024);
+        let (_client, mut proxy_side) = tokio::io::duplex(1 << 16);
+        let started = std::time::Instant::now();
+        let n = drain_bad_handshake(
+            &mut proxy_side,
+            &CancellationToken::new(),
+            BAD_HANDSHAKE_DRAIN_LIMIT,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(n, 0);
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(100) && waited < Duration::from_secs(2), "{:?}", waited);
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_drain_immediately() {
+        let (_client, mut proxy_side) = tokio::io::duplex(1 << 16);
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            c.cancel();
+        });
+        let started = std::time::Instant::now();
+        drain_bad_handshake(&mut proxy_side, &cancel, BAD_HANDSHAKE_DRAIN_LIMIT, Duration::from_secs(10)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn bad_handshake_keeps_connection_open_and_drains() {
+        // Через serve_core: 64 байта мусора вместо handshake. Прокси не
+        // закрывает соединение сразу и продолжает читать.
+        let pools = ProxyPools::new(CancellationToken::new());
+        let (mut client, proxy_side) = tokio::io::duplex(1 << 20);
+        let (r, w) = tokio::io::split(proxy_side);
+        let cancel = CancellationToken::new();
+        let bad_before = STATS.connections_bad.load(Ordering::SeqCst);
+        let server = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                serve_core(&pools, r, w, "drain-test".into(), vec![0x11; 16], cancel).await;
+            })
+        };
+        // Не HTTP; с этим секретом расшифровывается в неверный proto tag
+        // (детерминированно: секрет и мусор фиксированы).
+        let mut junk = [0u8; 64];
+        junk[0] = 0xAB;
+        client.write_all(&junk).await.unwrap();
+        client.write_all(&[7u8; 4096]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!server.is_finished(), "соединение закрыто сразу после плохого handshake");
+        assert!(STATS.connections_bad.load(Ordering::SeqCst) > bad_before);
+        // Клиент закрывает — прокси выходит (EOF), не дожидаясь 10 с.
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+        drop(cancel);
     }
 }
