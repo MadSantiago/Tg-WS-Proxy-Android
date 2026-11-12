@@ -161,6 +161,66 @@ impl Default for Cfproxy429State {
 // Cloudflare proxy config
 pub static CFPROXY_ENABLED: AtomicBool = AtomicBool::new(true);
 
+// HTTP/2-мультиплексирование медиа через CF (десктоп v1.11.0 48954ff,
+// cfproxy_h2_media). На десктопе включено по умолчанию; здесь — выключено,
+// фича экспериментальная, включается через SetCfH2Media.
+pub static CFPROXY_H2_MEDIA: AtomicBool = AtomicBool::new(false);
+
+/// Условие маршрута H2 (десктоп ProxyConfig.h2_enabled без `not
+/// disable_secure`: H2 всегда идёт на 443 с TLS).
+pub fn h2_media_enabled() -> bool {
+    CFPROXY_H2_MEDIA.load(Ordering::Relaxed)
+        && CFPROXY_ENABLED.load(Ordering::Relaxed)
+        && !FORCE_TEST_DC.load(Ordering::Relaxed)
+}
+
+/// `transport` последнего OnNetworkChanged (0 неизвестно, 1 Wi-Fi,
+/// 2 сотовая, 3 прочее). По нему H2 выбирает профиль повторов.
+pub static NETWORK_TRANSPORT: AtomicI32 = AtomicI32::new(0);
+
+/// Тайминги повторов H2-канала (десктоп cf_h2.py: REPLAY_IDLE_SECONDS,
+/// REPLAY_REQUEST_SECONDS, REPLAY_RETRY_SECONDS и остальные).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct H2ReplayTiming {
+    /// Простой канала до повторного опроса последнего пакета.
+    pub idle: Duration,
+    /// Возраст запроса без заголовков ответа до повтора.
+    pub request: Duration,
+    /// Пауза между повторами одного пакета.
+    pub retry: Duration,
+    /// Сколько держать слот повтора, прежде чем заменить его.
+    pub slot: Duration,
+    /// Пакеты старше не повторяются.
+    pub max_age: Duration,
+}
+
+/// Wi-Fi и неизвестная сеть: значения десктопа.
+pub const H2_REPLAY_WIFI: H2ReplayTiming = H2ReplayTiming {
+    idle: Duration::from_millis(1000),
+    request: Duration::from_millis(3000),
+    retry: Duration::from_millis(2000),
+    slot: Duration::from_secs(30),
+    max_age: Duration::from_secs(30),
+};
+
+/// Сотовая сеть: исходная оценка под RTT 300+ мс, подтвердить на
+/// устройстве по счётчику повторов.
+pub const H2_REPLAY_CELLULAR: H2ReplayTiming = H2ReplayTiming {
+    idle: Duration::from_millis(2500),
+    request: Duration::from_millis(6000),
+    retry: Duration::from_millis(4000),
+    slot: Duration::from_secs(30),
+    max_age: Duration::from_secs(30),
+};
+
+pub fn h2_replay_timing() -> H2ReplayTiming {
+    if NETWORK_TRANSPORT.load(Ordering::Relaxed) == 2 {
+        H2_REPLAY_CELLULAR
+    } else {
+        H2_REPLAY_WIFI
+    }
+}
+
 pub struct CfproxyConfig {
     pub user_domain: String,
     pub domains: Vec<String>,
@@ -443,6 +503,11 @@ pub struct Stats {
     // Ошибки проверки сертификата / из них — по сроку действия (часы).
     pub tls_verify_errors: AtomicI64,
     pub tls_clock_errors: AtomicI64,
+    // Соединения через H2, POST-запросы, ошибки H2, TCP-соединения lane.
+    pub connections_h2: AtomicI64,
+    pub h2_requests: AtomicI64,
+    pub h2_errors: AtomicI64,
+    pub h2_tcp_connections: AtomicI64,
 }
 
 pub static STATS: Lazy<Stats> = Lazy::new(Stats::default);
@@ -468,7 +533,7 @@ impl Stats {
         format!(
             // Новые ключи — только в конец: Kotlin ищет up=/down=/active=
             // через indexOf (ProxyService.extractStat).
-            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={} tlserr={} tlsclk={}",
+            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={} tlserr={} tlsclk={} h2={} h2req={} h2err={} h2tcp={}",
             self.connections_total.load(Ordering::Relaxed),
             self.connections_active.load(Ordering::Relaxed),
             self.connections_ws.load(Ordering::Relaxed),
@@ -484,6 +549,10 @@ impl Stats {
             human_bytes(self.bytes_down.load(Ordering::Relaxed)),
             self.tls_verify_errors.load(Ordering::Relaxed),
             self.tls_clock_errors.load(Ordering::Relaxed),
+            self.connections_h2.load(Ordering::Relaxed),
+            self.h2_requests.load(Ordering::Relaxed),
+            self.h2_errors.load(Ordering::Relaxed),
+            self.h2_tcp_connections.load(Ordering::Relaxed),
         )
     }
 
@@ -537,6 +606,10 @@ impl Stats {
         self.cf_pool_misses.store(0, Ordering::Relaxed);
         self.tls_verify_errors.store(0, Ordering::Relaxed);
         self.tls_clock_errors.store(0, Ordering::Relaxed);
+        self.connections_h2.store(0, Ordering::Relaxed);
+        self.h2_requests.store(0, Ordering::Relaxed);
+        self.h2_errors.store(0, Ordering::Relaxed);
+        self.h2_tcp_connections.store(0, Ordering::Relaxed);
     }
 }
 
@@ -809,12 +882,20 @@ mod tests {
         st.bytes_down.store(1024 * 1024, Ordering::Relaxed);
         st.tls_verify_errors.store(5, Ordering::Relaxed);
         st.tls_clock_errors.store(2, Ordering::Relaxed);
+        st.connections_h2.store(4, Ordering::Relaxed);
+        st.h2_requests.store(40, Ordering::Relaxed);
+        st.h2_errors.store(1, Ordering::Relaxed);
+        st.h2_tcp_connections.store(2, Ordering::Relaxed);
         let s = st.summary();
-        assert!(s.ends_with(" up=2.0KB down=1.0MB tlserr=5 tlsclk=2"), "{}", s);
+        assert!(
+            s.ends_with(" up=2.0KB down=1.0MB tlserr=5 tlsclk=2 h2=4 h2req=40 h2err=1 h2tcp=2"),
+            "{}",
+            s
+        );
         assert_eq!(kotlin_extract_stat(&s, "up="), "2.0KB");
         assert_eq!(kotlin_extract_stat(&s, "down="), "1.0MB");
         assert_eq!(kotlin_extract_stat(&s, "active="), "3");
         st.reset();
-        assert!(st.summary().ends_with("tlserr=0 tlsclk=0"));
+        assert!(st.summary().ends_with("tlserr=0 tlsclk=0 h2=0 h2req=0 h2err=0 h2tcp=0"));
     }
 }

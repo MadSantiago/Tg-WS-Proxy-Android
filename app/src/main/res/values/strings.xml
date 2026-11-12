@@ -26,6 +26,7 @@
     <string name="autostart">Autostart</string>
     <string name="dc_addresses">Data center addresses</string>
     <string name="media_dcs">Media data centers</string>
+    <string name="cf_h2_media">Media multiplexing (HTTP/2)</string>
     <string name="experimental_mode">Experimental mode</string>
     <string name="done">Done</string>
     <string name="telegram_not_found">Telegram not found!</string>

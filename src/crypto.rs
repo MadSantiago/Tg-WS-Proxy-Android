@@ -179,55 +179,77 @@ impl MsgSplitter {
 /// Длина очередного пакета в начале `plain`: None — данных пока мало,
 /// Some(0) — пакет нулевой длины (разбиение отключается).
 fn next_packet_len(proto_type: i32, plain: &[u8]) -> Option<usize> {
-    if plain.is_empty() {
+    let header = transport_header(proto_type, plain)?;
+    if header.payload_len == 0 {
+        return Some(0);
+    }
+    let pkt_len = header.header_len + header.payload_len;
+    if plain.len() < pkt_len {
         return None;
     }
+    Some(pkt_len)
+}
+
+/// Заголовок транспортного пакета MTProto (открытый текст после clt_dec).
+/// Общий для MsgSplitter и H2 (`cf_h2::read_packet`), чтобы правила длины
+/// не расходились.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportHeader {
+    /// 1 или 4 байта (abridged), 4 (intermediate и padded).
+    pub header_len: usize,
+    /// Длина тела в байтах, без заголовка.
+    pub payload_len: usize,
+    /// Флаг quick ack: старший бит первого байта (abridged) или длины.
+    pub quick: bool,
+}
+
+/// Сколько байт заголовка нужно, зная первый байт (abridged: 1 или 4).
+pub fn transport_header_len(proto_type: i32, first: u8) -> usize {
     match proto_type {
-        PROTO_ABRIDGED => next_abridged_len(plain),
-        PROTO_INTERMEDIATE | PROTO_PADDED_INTERMEDIATE => next_intermediate_len(plain),
-        _ => Some(0),
+        PROTO_ABRIDGED if first & 0x7F == 0x7F => 4,
+        PROTO_ABRIDGED => 1,
+        _ => 4,
     }
 }
 
-fn next_abridged_len(plain: &[u8]) -> Option<usize> {
-    // _next_abridged_len: длинная форма при first == 0x7F или 0xFF
-    // (старший бит — quick ack).
-    let avail = plain.len();
-    let first = plain[0];
-    let (header_len, payload_len) = if first == 0x7F || first == 0xFF {
-        if avail < 4 {
-            return None;
+/// Разбирает заголовок в начале `plain`. None — данных на заголовок пока
+/// мало. Протокол вне трёх известных даёт нулевую длину.
+pub fn transport_header(proto_type: i32, plain: &[u8]) -> Option<TransportHeader> {
+    let first = *plain.first()?;
+    let header_len = transport_header_len(proto_type, first);
+    if plain.len() < header_len {
+        return None;
+    }
+    let header = match proto_type {
+        // _next_abridged_len: длинная форма при first == 0x7F или 0xFF
+        // (старший бит — quick ack).
+        PROTO_ABRIDGED => {
+            let words = if header_len == 4 {
+                (plain[1] as usize) | ((plain[2] as usize) << 8) | ((plain[3] as usize) << 16)
+            } else {
+                first as usize & 0x7F
+            };
+            TransportHeader {
+                header_len,
+                payload_len: words * 4,
+                quick: first & 0x80 != 0,
+            }
         }
-        let words = (plain[1] as usize) | ((plain[2] as usize) << 8) | ((plain[3] as usize) << 16);
-        (4usize, words * 4)
-    } else {
-        (1usize, (first as usize & 0x7F) * 4)
+        PROTO_INTERMEDIATE | PROTO_PADDED_INTERMEDIATE => {
+            let value = LittleEndian::read_u32(&plain[..4]);
+            TransportHeader {
+                header_len,
+                payload_len: (value & 0x7FFF_FFFF) as usize,
+                quick: value & 0x8000_0000 != 0,
+            }
+        }
+        _ => TransportHeader {
+            header_len,
+            payload_len: 0,
+            quick: false,
+        },
     };
-    if payload_len == 0 {
-        return Some(0);
-    }
-    let pkt_len = header_len + payload_len;
-    if avail < pkt_len {
-        return None;
-    }
-    Some(pkt_len)
-}
-
-fn next_intermediate_len(plain: &[u8]) -> Option<usize> {
-    let avail = plain.len();
-    if avail < 4 {
-        return None;
-    }
-    // Старший бит — quick ack.
-    let payload_len = (LittleEndian::read_u32(&plain[..4]) & 0x7FFFFFFF) as usize;
-    if payload_len == 0 {
-        return Some(0);
-    }
-    let pkt_len = 4 + payload_len;
-    if avail < pkt_len {
-        return None;
-    }
-    Some(pkt_len)
+    Some(header)
 }
 
 // ---------------------------------------------------------------------------

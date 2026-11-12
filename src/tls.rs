@@ -157,6 +157,18 @@ impl ServerCertVerifier for NoVerify {
 pub(crate) struct TlsConfigs {
     pub verified: Arc<ClientConfig>,
     pub fronting: Arc<ClientConfig>,
+    /// Как `verified`, но с ALPN `h2` (десктоп h2_transport.py,
+    /// `_default_ssl_context`). Отдельный конфиг: WS-контексты ALPN не
+    /// объявляют, и CF не должен выбирать для них h2.
+    pub h2: Arc<ClientConfig>,
+}
+
+pub const ALPN_H2: &[u8] = b"h2";
+
+fn with_h2_alpn(cfg: &ClientConfig) -> Arc<ClientConfig> {
+    let mut cfg = cfg.clone();
+    cfg.alpn_protocols = vec![ALPN_H2.to_vec()];
+    Arc::new(cfg)
 }
 
 fn finish(mut cfg: ClientConfig) -> Arc<ClientConfig> {
@@ -186,8 +198,10 @@ pub(crate) fn build_verified_configs(
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(FrontingVerifier { inner }))
         .with_no_client_auth();
+    let verified = finish(verified);
     TlsConfigs {
-        verified: finish(verified),
+        h2: with_h2_alpn(&verified),
+        verified,
         fronting: finish(fronting),
     }
 }
@@ -211,6 +225,16 @@ static TLS_INSECURE: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
             .with_no_client_auth(),
     )
 });
+
+static TLS_INSECURE_H2: Lazy<Arc<ClientConfig>> = Lazy::new(|| with_h2_alpn(&TLS_INSECURE));
+
+/// Конфиг для H2-lane к CF: проверка как у WS без fronting, ALPN `h2`.
+pub fn h2_client_config() -> Arc<ClientConfig> {
+    if !TLS_VERIFY.load(Ordering::Relaxed) {
+        return TLS_INSECURE_H2.clone();
+    }
+    TLS_VERIFIED.h2.clone()
+}
 
 /// Конфиг для исходящего TLS-соединения WS.
 pub fn client_config(fronting: bool) -> Arc<ClientConfig> {

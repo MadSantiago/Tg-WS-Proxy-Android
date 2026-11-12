@@ -18,6 +18,7 @@ interface ProxyLibrary : Library {
     fun SetCfWorkerDomains(domains: String)
     fun SetFakeTlsDomain(domain: String)
     fun SetDisableSecure(v: Int)
+    fun SetCfH2Media(v: Int)
     fun SetForceTestDc(v: Int)
     fun SetProxyProtocol(v: Int)
     fun OnNetworkChanged(state: Int, transport: Int): Int
@@ -65,6 +66,11 @@ object NativeProxy {
 
     fun setDisableSecure(v: Boolean) {
         ProxyLibrary.INSTANCE.SetDisableSecure(if (v) 1 else 0)
+    }
+
+    /** HTTP/2-мультиплексирование медиа через CF; вызывать до startProxy. */
+    fun setCfH2Media(v: Boolean) {
+        ProxyLibrary.INSTANCE.SetCfH2Media(if (v) 1 else 0)
     }
 
     fun setForceTestDc(v: Boolean) {

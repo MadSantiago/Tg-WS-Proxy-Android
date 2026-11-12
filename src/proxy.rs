@@ -1180,6 +1180,8 @@ impl CfWorkerPool {
 pub struct ProxyPools {
     pub ws: Arc<WsPool>,
     pub cf_worker: Arc<CfWorkerPool>,
+    // Lane HTTP/2 к CF для медиа (выключено, пока не SetCfH2Media(1)).
+    pub h2: Arc<crate::cf_h2::H2Pool>,
     cancel: CancellationToken,
     // Последнее событие сети, ожидающее применения после дебаунса.
     network_pending: parking_lot::Mutex<Option<(i32, i32)>>,
@@ -1208,6 +1210,7 @@ impl ProxyPools {
         ProxyPools {
             ws: Arc::new(WsPool::new(cancel_token.clone())),
             cf_worker: Arc::new(CfWorkerPool::new(cancel_token.clone())),
+            h2: Arc::new(crate::cf_h2::H2Pool::new()),
             cancel: cancel_token,
             network_pending: parking_lot::Mutex::new(None),
             network_debounce: debounce,
@@ -1264,8 +1267,11 @@ impl ProxyPools {
             network_transport_name(transport),
             idle
         );
+        // Профиль повторов H2 (Wi-Fi/сотовая) и закрытие lane старой сети.
+        NETWORK_TRANSPORT.store(transport, Ordering::Relaxed);
         self.ws.reset().await; // + TRY_FRONTING_FIRST = true
         self.cf_worker.reset().await;
+        self.h2.reset().await;
         IP_FAIL_UNTIL.write().clear();
         DC_FAIL_UNTIL.write().clear();
         reset_tcp_backoff();
@@ -1286,11 +1292,13 @@ impl ProxyPools {
     pub async fn close_all(&self) {
         self.ws.close_all().await;
         self.cf_worker.close().await;
+        self.h2.close().await;
     }
 
     pub async fn reset(&self) {
         self.ws.reset().await;
         self.cf_worker.reset().await;
+        self.h2.reset().await;
     }
 }
 
@@ -2171,6 +2179,7 @@ pub async fn do_fallback<R, W>(
     dc: i32,
     is_test: bool,
     is_media: bool,
+    proto: u32,
     splitter: Option<MsgSplitter>,
     clt_dec: &TrackedStream,
     clt_enc: &TrackedStream,
@@ -2262,6 +2271,30 @@ where
 
     // Шаг 2: cf-ws (без halves).
     if use_cf {
+        // Десктоп bridge.py do_fallback, ветка 'cf': медиа — сначала
+        // через готовый H2-lane. Без готового lane try_open сразу отдаёт
+        // None и готовит lane в фоне: клиент не ждёт preflight.
+        if is_media && h2_media_enabled() {
+            match pools.h2.try_open(dc, &label) {
+                Ok(Some(channel)) => {
+                    STATS.connections_h2.fetch_add(1, Ordering::Relaxed);
+                    STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
+                    crate::cf_h2::bridge_h2(
+                        conn_read,
+                        conn_write,
+                        channel,
+                        clt_dec.clone_state(),
+                        clt_enc.clone_state(),
+                        proto,
+                        cancel_token,
+                    )
+                    .await;
+                    return true;
+                }
+                Ok(None) => {}
+                Err(e) => ldebug!("[{}] H2 unavailable: {}", label, e),
+            }
+        }
         if let Some((ws, _chosen_domain)) =
             cfproxy_acquire_ws(dc, is_media, ws_path, &cancel_token).await
         {
@@ -2680,6 +2713,7 @@ async fn serve_core<R, W>(
                 dc,
                 is_test_dc,
                 is_media,
+                proto_int,
                 splitter,
                 &clt_decryptor,
                 &clt_encryptor,
@@ -2809,6 +2843,7 @@ async fn serve_core<R, W>(
             dc,
             is_test_dc,
             is_media,
+            proto_int,
             splitter_fb,
             &clt_decryptor,
             &clt_encryptor,
@@ -2866,6 +2901,7 @@ async fn serve_core<R, W>(
                     dc,
                     is_test_dc,
                     is_media,
+                    proto_int,
                     splitter_fb,
                     &clt_decryptor,
                     &clt_encryptor,
@@ -2891,6 +2927,7 @@ async fn serve_core<R, W>(
                         dc,
                         is_test_dc,
                         is_media,
+                        proto_int,
                         splitter_fb,
                         &clt_decryptor,
                         &clt_encryptor,
@@ -4451,5 +4488,187 @@ mod port80_tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
         TCP_BACKOFF.record_success(&key);
         reset_port_memory();
+    }
+}
+
+#[cfg(test)]
+mod h2_routing_tests {
+    use super::*;
+    use crate::cf_h2::test_support::*;
+    use crate::cf_h2::{encode_reply, H2Pool};
+    use crate::config::GLOBAL_STATE_TEST_LOCK;
+    use crate::crypto::PROTO_INTERMEDIATE;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    struct Globals {
+        h2: bool,
+        cf: bool,
+        force_test: bool,
+        transport: i32,
+        workers: Vec<String>,
+    }
+
+    impl Globals {
+        fn set(h2: bool) -> Self {
+            let saved = Globals {
+                h2: CFPROXY_H2_MEDIA.load(SeqCst),
+                cf: CFPROXY_ENABLED.load(SeqCst),
+                force_test: FORCE_TEST_DC.load(SeqCst),
+                transport: NETWORK_TRANSPORT.load(SeqCst),
+                workers: std::mem::take(&mut *CF_WORKER_DOMAINS.write()),
+            };
+            CFPROXY_H2_MEDIA.store(h2, SeqCst);
+            CFPROXY_ENABLED.store(true, SeqCst);
+            FORCE_TEST_DC.store(false, SeqCst);
+            let mut b = crate::balancer::BALANCER.write();
+            b.update_domains_list(&["reset.invalid".to_string()]);
+            b.update_domains_list(&["example.org".to_string()]);
+            saved
+        }
+    }
+
+    impl Drop for Globals {
+        fn drop(&mut self) {
+            CFPROXY_H2_MEDIA.store(self.h2, SeqCst);
+            CFPROXY_ENABLED.store(self.cf, SeqCst);
+            FORCE_TEST_DC.store(self.force_test, SeqCst);
+            NETWORK_TRANSPORT.store(self.transport, SeqCst);
+            *CF_WORKER_DOMAINS.write() = std::mem::take(&mut self.workers);
+        }
+    }
+
+    async fn pools_with_ready_lane(server: &Arc<TestServer>) -> ProxyPools {
+        let mut pools = ProxyPools::new(CancellationToken::new());
+        pools.h2 = Arc::new(H2Pool::with_connector(Arc::new(server.clone()), test_limits()));
+        assert!(pools.h2.try_open(4, "warmup").unwrap().is_none());
+        assert!(wait_until(|| pools.h2.lane_count() == 1, ms(2000)).await);
+        pools
+    }
+
+    #[test]
+    fn h2_route_requires_flag_cf_and_no_forced_test_dc() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.blocking_lock();
+        let _g = Globals::set(true);
+        assert!(h2_media_enabled());
+        CFPROXY_ENABLED.store(false, SeqCst);
+        assert!(!h2_media_enabled());
+        CFPROXY_ENABLED.store(true, SeqCst);
+        FORCE_TEST_DC.store(true, SeqCst);
+        assert!(!h2_media_enabled());
+        FORCE_TEST_DC.store(false, SeqCst);
+        CFPROXY_H2_MEDIA.store(false, SeqCst);
+        assert!(!h2_media_enabled());
+        // H2 не зависит от режима «порт 80».
+        CFPROXY_H2_MEDIA.store(true, SeqCst);
+        let ds = DISABLE_SECURE.swap(true, SeqCst);
+        assert!(h2_media_enabled());
+        DISABLE_SECURE.store(ds, SeqCst);
+    }
+
+    #[tokio::test]
+    async fn obfuscated_media_packets_pass_through_h2_fallback_unchanged() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let _g = Globals::set(true);
+        // Повторы-опросы (тот же пакет ещё раз) получают пустой ответ, как
+        // от сервера без новых данных; первый POST пакета — перевёрнутое тело.
+        let seen = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<Vec<u8>>::new()));
+        let server = TestServer::new(handler(move |_m, body, r| {
+            let seen = seen.clone();
+            async move {
+                if body.is_empty() {
+                    return r.full(501, b"");
+                }
+                if !seen.lock().insert(body.to_vec()) {
+                    return r.full(200, b"");
+                }
+                let mut reply = body.to_vec();
+                reply.reverse();
+                r.full(200, &reply)
+            }
+        }));
+        let pools = pools_with_ready_lane(&server).await;
+        // Ключи «после handshake»: оба шифра уже прошли 64 байта.
+        let mut clt_dec = cipher();
+        clt_dec.xor(&mut [0u8; 64]);
+        let clt_enc = clt_dec.clone_state();
+        let (tg_enc, tg_dec) = (cipher(), cipher());
+        let (client, proxy) = tokio::io::duplex(1 << 20);
+        let (pr, pw) = tokio::io::split(proxy);
+        let h2_before = STATS.connections_h2.load(SeqCst);
+        let fallback = tokio::spawn(async move {
+            do_fallback(
+                &pools,
+                pr,
+                pw,
+                &[0u8; 64],
+                "h2-route".into(),
+                4,
+                false,
+                true,
+                PROTO_TAG_INTERMEDIATE,
+                MsgSplitter::new(PROTO_TAG_INTERMEDIATE),
+                &clt_dec,
+                &clt_enc,
+                &tg_enc,
+                &tg_dec,
+                CancellationToken::new(),
+            )
+            .await
+        });
+        let (mut cr, mut cw) = tokio::io::split(client);
+        let mut enc = cipher();
+        enc.xor(&mut [0u8; 64]);
+        let mut dec = enc.clone_state();
+        let packets: Vec<Vec<u8>> = (0..3u8)
+            .map(|i| {
+                let mut p = b"authkey!".to_vec();
+                p.extend(vec![i; 32 + 16 * i as usize]);
+                p
+            })
+            .collect();
+        for p in &packets {
+            let mut frame = encode_reply(p, PROTO_INTERMEDIATE, 1 << 20).unwrap();
+            enc.xor(&mut frame);
+            cw.write_all(&frame).await.unwrap();
+            let mut head = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(2), cr.read_exact(&mut head)).await.unwrap().unwrap();
+            dec.xor(&mut head);
+            let len = u32::from_le_bytes(head) as usize;
+            let mut body = vec![0u8; len];
+            cr.read_exact(&mut body).await.unwrap();
+            dec.xor(&mut body);
+            let mut expected = p.clone();
+            expected.reverse();
+            assert_eq!(body, expected);
+        }
+        // Шифртекст клиента снят, рамка тоже: на сервер ушли сами пакеты.
+        let posts = server.posts();
+        for p in &packets {
+            assert!(posts.iter().any(|b| b[..] == p[..]));
+        }
+        assert!(posts.iter().all(|b| packets.iter().any(|p| b[..] == p[..])));
+        assert_eq!(STATS.connections_h2.load(SeqCst), h2_before + 1);
+        drop(cw);
+        drop(cr);
+        let ok = tokio::time::timeout(Duration::from_secs(2), fallback).await.unwrap().unwrap();
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn network_change_closes_h2_lanes_and_selects_replay_profile() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let _g = Globals::set(true);
+        let server = TestServer::new(handler(|_m, body, r| async move {
+            r.full(if body.is_empty() { 501 } else { 200 }, &body)
+        }));
+        let pools = pools_with_ready_lane(&server).await;
+        let channel = pools.h2.try_open(4, "t").unwrap().unwrap();
+        pools.apply_network_change(0, 2).await;
+        assert!(channel.is_closed());
+        assert_eq!(pools.h2.lane_count(), 0);
+        assert_eq!(NETWORK_TRANSPORT.load(SeqCst), 2);
+        assert_eq!(h2_replay_timing(), H2_REPLAY_CELLULAR);
+        pools.close_all().await;
+        assert!(pools.h2.try_open(4, "t").is_err());
     }
 }

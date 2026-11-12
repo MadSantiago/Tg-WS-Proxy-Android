@@ -25,6 +25,9 @@ class SettingsStore(private val context: Context) {
         // Режим «порт 80» (SetDisableSecure). Включён по умолчанию, как в форке (7c7f168):
         // CF на 80, прямой WS и TCP fallback — сначала 443, затем 80.
         const val DEFAULT_PORT80_FALLBACK = true
+        // HTTP/2-мультиплексирование медиа через CF (SetCfH2Media). Экспериментально,
+        // действует только при включённом экспериментальном режиме.
+        const val DEFAULT_CF_H2_MEDIA = false
     }
 
     private object Keys {
@@ -45,6 +48,7 @@ class SettingsStore(private val context: Context) {
         val AUTO_START_ON_BOOT = booleanPreferencesKey("auto_start_on_boot")
         val SECRET_KEY = stringPreferencesKey("secret_key")
         val PORT80_FALLBACK = booleanPreferencesKey("port80_fallback")
+        val CF_H2_MEDIA = booleanPreferencesKey("cf_h2_media")
         val LOG_SHOW_DEBUG = booleanPreferencesKey("log_show_debug")
         val LOG_SHOW_INFO = booleanPreferencesKey("log_show_info")
         val LOG_SHOW_ERROR = booleanPreferencesKey("log_show_error")
@@ -92,6 +96,7 @@ class SettingsStore(private val context: Context) {
     val autoStartOnBoot: Flow<Boolean> = context.dataStore.data.map { it[Keys.AUTO_START_ON_BOOT] ?: false }
     val secretKey: Flow<String> = context.dataStore.data.map { it[Keys.SECRET_KEY] ?: "" }
     val port80Fallback: Flow<Boolean> = context.dataStore.data.map { it[Keys.PORT80_FALLBACK] ?: DEFAULT_PORT80_FALLBACK }
+    val cfH2Media: Flow<Boolean> = context.dataStore.data.map { it[Keys.CF_H2_MEDIA] ?: DEFAULT_CF_H2_MEDIA }
 
     val logShowDebug: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_DEBUG] ?: false }
     val logShowInfo: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_INFO] ?: DEFAULT_LOG_SHOW_INFO }
@@ -114,6 +119,10 @@ class SettingsStore(private val context: Context) {
     /** Сохраняет режим «порт 80». */
     suspend fun savePort80Fallback(enabled: Boolean) {
         context.dataStore.edit { it[Keys.PORT80_FALLBACK] = enabled }
+    }
+
+    suspend fun saveCfH2Media(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.CF_H2_MEDIA] = enabled }
     }
 
     suspend fun saveSecretKey(key: String) {

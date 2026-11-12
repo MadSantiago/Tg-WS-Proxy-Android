@@ -6,6 +6,7 @@ pub mod proxy;
 pub mod ws;
 pub mod balancer;
 pub mod tls;
+pub mod cf_h2;
 
 use config::*;
 use once_cell::sync::OnceCell;
@@ -82,6 +83,9 @@ pub unsafe extern "C" fn StartProxy(
 
     init_logging(is_verbose);
     tls::log_startup_tls_state();
+    if CFPROXY_H2_MEDIA.load(Ordering::Relaxed) {
+        linfo!("CF H2 media multiplexing: on (experimental)");
+    }
     cfproxy::clear_cfproxy_429_cooldowns();
     proxy::reset_tcp_backoff();
     proxy::reset_port_memory();
@@ -293,6 +297,14 @@ pub extern "C" fn SetDisableSecure(v: c_int) {
     // fallback — 443, затем 80. По умолчанию выключен; приложение передаёт
     // значение явно перед StartProxy.
     DISABLE_SECURE.store(v != 0, Ordering::Relaxed);
+}
+
+/// HTTP/2-мультиплексирование медиа через CF. `v != 0` — включить.
+/// По умолчанию выключено (экспериментальная настройка). Вызывается до
+/// StartProxy, как остальные сеттеры.
+#[unsafe(no_mangle)]
+pub extern "C" fn SetCfH2Media(v: c_int) {
+    CFPROXY_H2_MEDIA.store(v != 0, Ordering::Relaxed);
 }
 
 /// Аварийный рубильник проверки TLS-сертификатов WS.

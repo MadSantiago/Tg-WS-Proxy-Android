@@ -26,6 +26,7 @@
     <string name="autostart">Автозапуск</string>
     <string name="dc_addresses">Адреса датацентров</string>
     <string name="media_dcs">Медиа датацентры</string>
+    <string name="cf_h2_media">Мультиплексирование медиа (HTTP/2)</string>
     <string name="experimental_mode">Экспериментальный режим</string>
     <string name="done">Готово</string>
     <string name="telegram_not_found">Telegram не найден!</string>

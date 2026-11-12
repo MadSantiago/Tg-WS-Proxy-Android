@@ -555,7 +555,7 @@ pub fn build_frame(opcode: u8, data: &[u8], mask: bool) -> Vec<u8> {
 // path, sni, secure) из proxy/raw_websocket.py
 // ---------------------------------------------------------------------------
 
-fn set_sock_opts(stream: &TcpStream) {
+pub(crate) fn set_sock_opts(stream: &TcpStream) {
     if TCP_NODELAY {
         let _ = stream.set_nodelay(true);
     }
@@ -590,7 +590,7 @@ pub fn ws_handshake_timeout(total: Duration) -> Duration {
     }
 }
 
-fn server_name(domain: &str) -> ServerName<'static> {
+pub(crate) fn server_name(domain: &str) -> ServerName<'static> {
     ServerName::try_from(domain.to_string())
         .unwrap_or_else(|_| ServerName::IpAddress("127.0.0.1".parse::<IpAddr>().unwrap().into()))
 }

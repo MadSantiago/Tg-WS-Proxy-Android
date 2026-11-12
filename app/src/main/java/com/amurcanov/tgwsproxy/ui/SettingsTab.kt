@@ -91,6 +91,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val savedCustomDomainEnabled by settingsStore.customCfDomainEnabled.collectAsStateWithLifecycle(initialValue = false)
     val savedCustomDomain by settingsStore.customCfDomain.collectAsStateWithLifecycle(initialValue = "")
     val autoStartOnBoot by settingsStore.autoStartOnBoot.collectAsStateWithLifecycle(initialValue = false)
+    val cfH2Media by settingsStore.cfH2Media.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_CF_H2_MEDIA)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
     if (!isReady) {
@@ -407,6 +408,29 @@ fun SettingsTab(settingsStore: SettingsStore) {
                     },
                     enabled = !isRunning
                 )
+            }
+
+            // Экспериментально: HTTP/2-мультиплексирование медиа через CF
+            // (SetCfH2Media). Применяется при следующем запуске прокси.
+            if (experimentalMode && cfEnabled) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        stringResource(com.amurcanov.tgwsproxy.R.string.cf_h2_media),
+                        modifier = Modifier.weight(1f).padding(start = 28.dp),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Switch(
+                        checked = cfH2Media,
+                        onCheckedChange = { enabled ->
+                            scope.launch { settingsStore.saveCfH2Media(enabled) }
+                        },
+                        enabled = !isRunning
+                    )
+                }
             }
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
