@@ -5,6 +5,7 @@ pub mod faketls;
 pub mod proxy;
 pub mod ws;
 pub mod balancer;
+pub mod tls;
 
 use config::*;
 use once_cell::sync::OnceCell;
@@ -80,6 +81,7 @@ pub unsafe extern "C" fn StartProxy(
     let is_verbose = verbose != 0;
 
     init_logging(is_verbose);
+    tls::log_startup_tls_state();
     cfproxy::clear_cfproxy_429_cooldowns();
     proxy::reset_tcp_backoff();
 
@@ -287,6 +289,14 @@ pub unsafe extern "C" fn SetFakeTlsDomain(c_domain: *const c_char) {
 pub extern "C" fn SetDisableSecure(v: c_int) {
     // --no-secure: порт 80 для CF proxy/worker.
     DISABLE_SECURE.store(v != 0, Ordering::Relaxed);
+}
+
+/// Аварийный рубильник проверки TLS-сертификатов WS.
+/// `v != 0` — проверять (по умолчанию), `v == 0` — не проверять.
+/// Вызывается до StartProxy, как остальные сеттеры.
+#[unsafe(no_mangle)]
+pub extern "C" fn SetTlsVerify(v: c_int) {
+    TLS_VERIFY.store(v != 0, Ordering::Relaxed);
 }
 
 #[unsafe(no_mangle)]

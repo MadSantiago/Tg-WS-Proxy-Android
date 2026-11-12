@@ -112,6 +112,9 @@ pub static POOL_SIZE: AtomicI32 = AtomicI32::new(DEFAULT_POOL_SZ);
 pub static LOG_VERBOSE: AtomicBool = AtomicBool::new(false);
 // proxy/config.py::ProxyConfig — мобильные эквиваленты
 pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(true);
+// Проверка TLS-сертификатов WS (по умолчанию включена). Выключается
+// только аварийным рубильником SetTlsVerify(0).
+pub static TLS_VERIFY: AtomicBool = AtomicBool::new(true);
 pub static FORCE_TEST_DC: AtomicBool = AtomicBool::new(false);
 pub static PROXY_PROTOCOL: AtomicBool = AtomicBool::new(false);
 
@@ -409,6 +412,9 @@ pub struct Stats {
     pub pool_misses: AtomicI64,
     pub cf_pool_hits: AtomicI64,
     pub cf_pool_misses: AtomicI64,
+    // Ошибки проверки сертификата / из них — по сроку действия (часы).
+    pub tls_verify_errors: AtomicI64,
+    pub tls_clock_errors: AtomicI64,
 }
 
 pub static STATS: Lazy<Stats> = Lazy::new(Stats::default);
@@ -432,7 +438,9 @@ impl Stats {
             "n/a".to_string()
         };
         format!(
-            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
+            // Новые ключи — только в конец: Kotlin ищет up=/down=/active=
+            // через indexOf (ProxyService.extractStat).
+            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={} tlserr={} tlsclk={}",
             self.connections_total.load(Ordering::Relaxed),
             self.connections_active.load(Ordering::Relaxed),
             self.connections_ws.load(Ordering::Relaxed),
@@ -446,6 +454,8 @@ impl Stats {
             cf_pool_s,
             human_bytes(self.bytes_up.load(Ordering::Relaxed)),
             human_bytes(self.bytes_down.load(Ordering::Relaxed)),
+            self.tls_verify_errors.load(Ordering::Relaxed),
+            self.tls_clock_errors.load(Ordering::Relaxed),
         )
     }
 
@@ -466,6 +476,10 @@ impl Stats {
         let err = self.ws_errors.load(Ordering::Relaxed);
         if err > 0 {
             parts.push(format!("ош:{}", err));
+        }
+        let tls = self.tls_verify_errors.load(Ordering::Relaxed);
+        if tls > 0 {
+            parts.push(format!("tls:{}", tls));
         }
         parts.push(format!(
             "↑{} ↓{}",
@@ -493,6 +507,8 @@ impl Stats {
         self.pool_misses.store(0, Ordering::Relaxed);
         self.cf_pool_hits.store(0, Ordering::Relaxed);
         self.cf_pool_misses.store(0, Ordering::Relaxed);
+        self.tls_verify_errors.store(0, Ordering::Relaxed);
+        self.tls_clock_errors.store(0, Ordering::Relaxed);
     }
 }
 
@@ -744,5 +760,33 @@ mod tests {
         ip_cooldown_record_success("");
         ip_cooldown_record_success("198.51.100.78");
         assert!(!IP_FAIL_UNTIL.read().contains_key("198.51.100.78"));
+    }
+
+    /// Повтор ProxyService.extractStat из Kotlin: indexOf(key) до пробела.
+    fn kotlin_extract_stat<'a>(stats: &'a str, key: &str) -> &'a str {
+        match stats.find(key) {
+            None => "0B",
+            Some(i) => {
+                let rest = &stats[i + key.len()..];
+                rest.split(' ').next().unwrap_or("")
+            }
+        }
+    }
+
+    #[test]
+    fn stats_summary_appends_tls_counters_without_breaking_kotlin_parsing() {
+        let st = Stats::default();
+        st.connections_active.store(3, Ordering::Relaxed);
+        st.bytes_up.store(2048, Ordering::Relaxed);
+        st.bytes_down.store(1024 * 1024, Ordering::Relaxed);
+        st.tls_verify_errors.store(5, Ordering::Relaxed);
+        st.tls_clock_errors.store(2, Ordering::Relaxed);
+        let s = st.summary();
+        assert!(s.ends_with(" up=2.0KB down=1.0MB tlserr=5 tlsclk=2"), "{}", s);
+        assert_eq!(kotlin_extract_stat(&s, "up="), "2.0KB");
+        assert_eq!(kotlin_extract_stat(&s, "down="), "1.0MB");
+        assert_eq!(kotlin_extract_stat(&s, "active="), "3");
+        st.reset();
+        assert!(st.summary().ends_with("tlserr=0 tlsclk=0"));
     }
 }
