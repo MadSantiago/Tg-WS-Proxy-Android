@@ -944,3 +944,25 @@ pub async fn connect_fronted(ip: &str, domain: &str, path: &str) -> Option<RawWe
         Err(_) => None,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Тестовые помощники
+// ---------------------------------------------------------------------------
+
+/// Пара «RawWebSocket поверх локального TCP» + серверный конец (без HTTP
+/// handshake). По серверному концу тест видит, закрыт ли WS.
+#[cfg(test)]
+pub(crate) async fn test_ws_pair() -> (RawWebSocket, TcpStream) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (client, server) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    let (read_half, write_half) = tokio::io::split(client.unwrap());
+    let ws = RawWebSocket {
+        reader: tokio::sync::Mutex::new(WsReader::Plain(BufReader::new(read_half))),
+        writer: tokio::sync::Mutex::new(WsWriter::Plain(write_half)),
+        frag: tokio::sync::Mutex::new(Vec::new()),
+        closed: AtomicBool::new(false),
+        secure: false,
+    };
+    (ws, server.unwrap().0)
+}

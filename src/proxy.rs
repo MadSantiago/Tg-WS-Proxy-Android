@@ -521,124 +521,453 @@ pub struct CfWorkerEntry {
     pub worker_domain: String,
 }
 
+/// Тайминги пула CF worker. В проде — константы из config.rs, тесты
+/// подставляют короткие значения (как десктопные тесты патчат атрибуты класса).
+#[derive(Clone, Copy, Debug)]
+pub struct CfWorkerPoolTimings {
+    pub max_age: f64,
+    pub check_interval: f64,
+    pub backoff_initial: f64,
+    pub backoff_max: f64,
+    /// Android: пауза ротации, если пул DC не запрашивали столько секунд.
+    pub idle_stop: f64,
+}
+
+impl Default for CfWorkerPoolTimings {
+    fn default() -> Self {
+        CfWorkerPoolTimings {
+            max_age: CF_WORKER_POOL_MAX_AGE,
+            check_interval: CF_WORKER_POOL_CHECK_INTERVAL,
+            backoff_initial: CF_WORKER_REFILL_BACKOFF_INITIAL,
+            backoff_max: CF_WORKER_REFILL_BACKOFF_MAX,
+            idle_stop: CF_WORKER_ROTATION_IDLE_STOP,
+        }
+    }
+}
+
+// Минимальный сон ротации, чтобы граничные значения времени не дали busy-loop.
+const CF_WORKER_MIN_SLEEP: f64 = 0.01;
+// Сколько StopProxy ждёт завершения фоновых задач пула.
+const CF_WORKER_CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+/// Состояние одного DC — аналог записей _idle/_refilling/_rotating/
+/// _refill_failures/_refill_after десктопа, собранных в одну структуру.
+struct CfWorkerSlot {
+    bucket: VecDeque<CfWorkerEntry>,
+    refilling: bool,
+    rotating: bool,
+    failures: u32,
+    refill_after: f64,
+    last_requested: f64,
+}
+
+impl CfWorkerSlot {
+    fn new(now: f64) -> Self {
+        CfWorkerSlot {
+            bucket: VecDeque::new(),
+            refilling: false,
+            rotating: false,
+            failures: 0,
+            refill_after: 0.0,
+            last_requested: now,
+        }
+    }
+}
+
+struct CfWorkerState {
+    // Растёт при каждом reset(): задачи прошлого поколения не трогают новое.
+    epoch: u64,
+    slots: HashMap<i32, CfWorkerSlot>,
+}
+
+#[cfg(test)]
+type CfConnectHook = Arc<
+    dyn Fn(i32) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(RawWebSocket, String)>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct CfWorkerPool {
-    idle: Mutex<HashMap<i32, VecDeque<CfWorkerEntry>>>,
-    refilling: Mutex<HashSet<i32>>,
+    // Синхронный мьютекс: под ним нет await.
+    state: parking_lot::Mutex<CfWorkerState>,
     exhausted_until: Mutex<HashMap<String, f64>>,
-    cancel_token: CancellationToken,
+    timings: CfWorkerPoolTimings,
+    // Дочерний токен корневого: отменяется и StopProxy, и close().
+    cancel: CancellationToken,
+    tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    #[cfg(test)]
+    connect_hook: parking_lot::Mutex<Option<CfConnectHook>>,
+    #[cfg(test)]
+    connect_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+enum CfSlotFlag {
+    Refilling,
+    Rotating,
+}
+
+/// RAII-guard: снимает флаг refilling/rotating при любом выходе из задачи,
+/// включая отмену (аналог `finally: self._refilling.pop(dc)` десктопа).
+struct CfSlotFlagGuard {
+    pool: Arc<CfWorkerPool>,
+    dc: i32,
+    epoch: u64,
+    flag: CfSlotFlag,
+}
+
+impl Drop for CfSlotFlagGuard {
+    fn drop(&mut self) {
+        let mut st = self.pool.state.lock();
+        if st.epoch != self.epoch {
+            return;
+        }
+        if let Some(slot) = st.slots.get_mut(&self.dc) {
+            match self.flag {
+                CfSlotFlag::Refilling => slot.refilling = false,
+                CfSlotFlag::Rotating => slot.rotating = false,
+            }
+        }
+    }
+}
+
+/// Результат одного шага ротации (вынесен отдельно, чтобы тестировать без таймеров).
+struct CfRotationTick {
+    expired: Vec<RawWebSocket>,
+    ready: usize,
+    need_refill: bool,
+    idle_stop: bool,
+    wake_at: f64,
+}
+
+fn close_detached(sockets: Vec<RawWebSocket>) {
+    for ws in sockets {
+        tokio::spawn(async move {
+            ws.close().await;
+        });
+    }
 }
 
 impl CfWorkerPool {
     pub fn new(cancel_token: CancellationToken) -> CfWorkerPool {
+        Self::with_timings(cancel_token, CfWorkerPoolTimings::default())
+    }
+
+    pub fn with_timings(cancel_token: CancellationToken, timings: CfWorkerPoolTimings) -> CfWorkerPool {
         CfWorkerPool {
-            idle: Mutex::new(HashMap::new()),
-            refilling: Mutex::new(HashSet::new()),
+            state: parking_lot::Mutex::new(CfWorkerState {
+                epoch: 0,
+                slots: HashMap::new(),
+            }),
             exhausted_until: Mutex::new(HashMap::new()),
-            cancel_token,
+            timings,
+            cancel: cancel_token.child_token(),
+            tasks: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            connect_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            connect_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    pub async fn get(
+    /// min(pool_size, PER_DC_LIMIT); 0 — пул выключен.
+    fn target_size() -> usize {
+        CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize)
+    }
+
+    // EOF и ошибка сокета (RawWebSocket::is_stale()) здесь не проверяются.
+    fn is_stale(&self, entry: &CfWorkerEntry, now: f64) -> bool {
+        now - entry.created >= self.timings.max_age || entry.ws.is_closed()
+    }
+
+    fn spawn_tracked<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = tokio::spawn(fut);
+        let mut tasks = self.tasks.lock();
+        tasks.retain(|h| !h.is_finished());
+        tasks.push(handle);
+    }
+
+    /// Готовый WS из пула или None. И при попадании, и при промахе
+    /// заказывает пополнение (порт get() из 1636903).
+    pub fn get(
         self: &Arc<Self>,
         dc: i32,
         fallback_dst: String,
         worker_domains: Vec<String>,
     ) -> Option<(RawWebSocket, String)> {
+        if Self::target_size() == 0 || worker_domains.is_empty() {
+            return None;
+        }
         let now = now_monotonic();
-        let entry = {
-            let mut map = self.idle.lock().await;
-            let bucket = map.entry(dc).or_insert_with(VecDeque::new);
+        let mut stale = Vec::new();
+        let (hit, left) = {
+            let mut st = self.state.lock();
+            let slot = st
+                .slots
+                .entry(dc)
+                .or_insert_with(|| CfWorkerSlot::new(now));
+            slot.last_requested = now;
             let mut hit = None;
-            while let Some(e) = bucket.pop_front() {
-                if now - e.created > CF_WORKER_POOL_MAX_AGE || e.ws.is_closed() {
-                    let ws = e.ws;
-                    tokio::spawn(async move {
-                        ws.close().await;
-                    });
+            while let Some(entry) = slot.bucket.pop_front() {
+                if self.is_stale(&entry, now) {
+                    stale.push(entry.ws);
                     continue;
                 }
-                hit = Some(e);
+                hit = Some(entry);
                 break;
             }
-            hit
+            (hit, slot.bucket.len())
         };
-        match entry {
+        close_detached(stale);
+        match &hit {
             Some(e) => {
                 STATS.cf_pool_hits.fetch_add(1, Ordering::Relaxed);
                 ldebug!(
-                    "CF worker pool hit DC{} via {} (age={:.1}s)",
+                    "CF worker pool hit DC{} via {} (age={:.1}s, left={})",
                     dc,
                     e.worker_domain,
-                    now - e.created
+                    now - e.created,
+                    left
                 );
-                self.schedule_refill(dc, fallback_dst, worker_domains).await;
-                Some((e.ws, e.worker_domain))
             }
             None => {
                 STATS.cf_pool_misses.fetch_add(1, Ordering::Relaxed);
-                None
             }
         }
+        self.schedule_refill(dc, fallback_dst, worker_domains);
+        hit.map(|e| (e.ws, e.worker_domain))
     }
 
-    async fn schedule_refill(&self, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
-        {
-            let mut r = self.refilling.lock().await;
-            if r.contains(&dc) {
-                return;
-            }
-            r.insert(dc);
-        }
-        // PER_DC_LIMIT уважаем через проверку размера в refill.
-        let _ = (fallback_dst, worker_domains);
-    }
-
-    pub async fn refill_now(
-        self: &Arc<Self>,
-        dc: i32,
-        fallback_dst: String,
-        worker_domains: Vec<String>,
-    ) {
-        let should = {
-            let mut r = self.refilling.lock().await;
-            if r.contains(&dc) {
-                false
-            } else {
-                r.insert(dc);
-                true
-            }
-        };
-        if !should {
+    fn schedule_refill(self: &Arc<Self>, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
+        if self.cancel.is_cancelled() || Self::target_size() == 0 || worker_domains.is_empty() {
             return;
         }
+        self.schedule_rotation(dc, &fallback_dst, &worker_domains);
+        let now = now_monotonic();
+        let epoch = {
+            let mut st = self.state.lock();
+            let epoch = st.epoch;
+            let slot = st
+                .slots
+                .entry(dc)
+                .or_insert_with(|| CfWorkerSlot::new(now));
+            if slot.refilling || now < slot.refill_after {
+                return;
+            }
+            slot.refilling = true;
+            epoch
+        };
+        let guard = CfSlotFlagGuard {
+            pool: self.clone(),
+            dc,
+            epoch,
+            flag: CfSlotFlag::Refilling,
+        };
         let pool = self.clone();
-        let cancel = self.cancel_token.clone();
-        tokio::spawn(async move {
-            let _cancel = cancel;
-            {
-                let map = pool.idle.lock().await;
-                let cur = map.get(&dc).map(|b| b.len()).unwrap_or(0);
-                if cur >= CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize) {
-                    pool.refilling.lock().await.remove(&dc);
-                    return;
-                }
-            }
-            if let Some((ws, domain)) = pool
-                .connect_one(worker_domains.clone(), fallback_dst.clone(), dc)
-                .await
-            {
-                let mut map = pool.idle.lock().await;
-                map.entry(dc)
-                    .or_insert_with(VecDeque::new)
-                    .push_back(CfWorkerEntry {
-                        ws,
-                        created: now_monotonic(),
-                        worker_domain: domain,
-                    });
-                ldebug!("CF worker pool refilled DC{}: ready", dc);
-            }
-            pool.refilling.lock().await.remove(&dc);
+        self.spawn_tracked(async move {
+            let _guard = guard;
+            pool.refill(dc, fallback_dst, worker_domains, epoch).await;
         });
+    }
+
+    async fn refill(self: Arc<Self>, dc: i32, fallback_dst: String, worker_domains: Vec<String>, epoch: u64) {
+        let target = Self::target_size();
+        let needed = {
+            let st = self.state.lock();
+            if st.epoch != epoch {
+                return;
+            }
+            match st.slots.get(&dc) {
+                Some(slot) => target.saturating_sub(slot.bucket.len()),
+                None => return,
+            }
+        };
+        if needed == 0 {
+            return;
+        }
+        let mut connected = 0usize;
+        for _ in 0..needed {
+            let result = tokio::select! {
+                _ = self.cancel.cancelled() => return,
+                r = self.connect_one(worker_domains.clone(), fallback_dst.clone(), dc) => r,
+            };
+            let Some((ws, worker_domain)) = result else {
+                break;
+            };
+            let now = now_monotonic();
+            let rejected = {
+                let mut st = self.state.lock();
+                let current = st.epoch == epoch;
+                match st.slots.get_mut(&dc) {
+                    // Android: пока шло соединение, ротация могла уйти в паузу
+                    // по простою — тогда сокет не держим.
+                    Some(slot) if current && now - slot.last_requested < self.timings.idle_stop => {
+                        slot.bucket.push_back(CfWorkerEntry {
+                            ws,
+                            created: now,
+                            worker_domain,
+                        });
+                        None
+                    }
+                    _ => Some(ws),
+                }
+            };
+            if let Some(ws) = rejected {
+                ws.close().await;
+                return;
+            }
+            connected += 1;
+        }
+        let now = now_monotonic();
+        let (ready, retry_in) = {
+            let mut st = self.state.lock();
+            if st.epoch != epoch {
+                return;
+            }
+            let Some(slot) = st.slots.get_mut(&dc) else {
+                return;
+            };
+            let retry_in = if connected > 0 {
+                slot.failures = 0;
+                slot.refill_after = 0.0;
+                None
+            } else {
+                slot.failures = slot.failures.saturating_add(1);
+                let delay = backoff_delay(
+                    slot.failures,
+                    self.timings.backoff_initial,
+                    self.timings.backoff_max,
+                    POOL_BACKOFF_MAX_SHIFT,
+                );
+                slot.refill_after = now + delay;
+                Some(delay)
+            };
+            (slot.bucket.len(), retry_in)
+        };
+        if let Some(delay) = retry_in {
+            linfo!("CF worker pool refill failed for DC{}, retry in {:.0}s", dc, delay);
+        }
+        ldebug!("CF worker pool refilled DC{}: {} ready", dc, ready);
+    }
+
+    fn schedule_rotation(self: &Arc<Self>, dc: i32, fallback_dst: &str, worker_domains: &[String]) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let now = now_monotonic();
+        let epoch = {
+            let mut st = self.state.lock();
+            let epoch = st.epoch;
+            let slot = st
+                .slots
+                .entry(dc)
+                .or_insert_with(|| CfWorkerSlot::new(now));
+            if slot.rotating {
+                return;
+            }
+            slot.rotating = true;
+            epoch
+        };
+        let guard = CfSlotFlagGuard {
+            pool: self.clone(),
+            dc,
+            epoch,
+            flag: CfSlotFlag::Rotating,
+        };
+        let pool = self.clone();
+        let fallback_dst = fallback_dst.to_string();
+        let worker_domains = worker_domains.to_vec();
+        self.spawn_tracked(async move {
+            let _guard = guard;
+            pool.rotate(dc, fallback_dst, worker_domains, epoch).await;
+        });
+    }
+
+    fn rotation_tick(&self, dc: i32, epoch: u64, now: f64) -> Option<CfRotationTick> {
+        let target = Self::target_size();
+        let t = self.timings;
+        let mut st = self.state.lock();
+        if st.epoch != epoch {
+            return None;
+        }
+        let slot = st.slots.get_mut(&dc)?;
+        if now - slot.last_requested >= t.idle_stop {
+            // Android: пул давно не нужен — закрываем его и не будим CPU.
+            let expired = slot.bucket.drain(..).map(|e| e.ws).collect();
+            return Some(CfRotationTick {
+                expired,
+                ready: 0,
+                need_refill: false,
+                idle_stop: true,
+                wake_at: now,
+            });
+        }
+        let mut expired = Vec::new();
+        let mut ready = VecDeque::with_capacity(slot.bucket.len());
+        while let Some(entry) = slot.bucket.pop_front() {
+            if self.is_stale(&entry, now) {
+                expired.push(entry.ws);
+            } else {
+                ready.push_back(entry);
+            }
+        }
+        slot.bucket = ready;
+        let mut wake_at = now + t.check_interval;
+        for entry in &slot.bucket {
+            wake_at = wake_at.min(entry.created + t.max_age);
+        }
+        if !slot.refilling && slot.refill_after > now {
+            wake_at = wake_at.min(slot.refill_after);
+        }
+        wake_at = wake_at.min(slot.last_requested + t.idle_stop);
+        Some(CfRotationTick {
+            expired,
+            ready: slot.bucket.len(),
+            need_refill: slot.bucket.len() < target,
+            idle_stop: false,
+            wake_at,
+        })
+    }
+
+    async fn rotate(self: Arc<Self>, dc: i32, fallback_dst: String, worker_domains: Vec<String>, epoch: u64) {
+        loop {
+            if self.cancel.is_cancelled() || Self::target_size() == 0 {
+                return;
+            }
+            let Some(tick) = self.rotation_tick(dc, epoch, now_monotonic()) else {
+                return;
+            };
+            let expired = tick.expired.len();
+            close_detached(tick.expired);
+            if tick.idle_stop {
+                ldebug!(
+                    "CF worker pool DC{}: not requested for {:.0}s, rotation paused, {} closed",
+                    dc,
+                    self.timings.idle_stop,
+                    expired
+                );
+                return;
+            }
+            if expired > 0 {
+                ldebug!(
+                    "CF worker pool rotated DC{}: {} stale, {} ready",
+                    dc,
+                    expired,
+                    tick.ready
+                );
+            }
+            if tick.need_refill {
+                self.schedule_refill(dc, fallback_dst.clone(), worker_domains.clone());
+            }
+            let sleep_for = (tick.wake_at - now_monotonic()).max(CF_WORKER_MIN_SLEEP);
+            tokio::select! {
+                _ = self.cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs_f64(sleep_for)) => {}
+            }
+        }
     }
 
     async fn connect_one(
@@ -647,6 +976,14 @@ impl CfWorkerPool {
         fallback_dst: String,
         dc: i32,
     ) -> Option<(RawWebSocket, String)> {
+        #[cfg(test)]
+        {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
+            let hook = self.connect_hook.lock().clone();
+            if let Some(hook) = hook {
+                return hook(dc).await;
+            }
+        }
         let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
         let query = format!("dst={}&dc={}", fallback_dst, dc);
         let path = format!("/apiws?{}", query);
@@ -656,6 +993,13 @@ impl CfWorkerPool {
             {
                 Ok(ws) => return Some((ws, worker_domain)),
                 Err(exc) => {
+                    ldebug!(
+                        "CF worker pool connect DC{} via {} for {} failed: {}",
+                        dc,
+                        worker_domain,
+                        fallback_dst,
+                        exc.compact()
+                    );
                     self.report_failure(&worker_domain, &exc).await;
                 }
             }
@@ -692,12 +1036,11 @@ impl CfWorkerPool {
 
     pub async fn report_failure(&self, _worker_domain: &str, _exc: &WsError) {
         // TODO: picks up 429/daily-limit handling — как в оригинале пока no-op.
-        return;
     }
 
     pub async fn warmup(self: &Arc<Self>, dc_opt_map: &HashMap<i32, String>) {
         let worker_domains = CF_WORKER_DOMAINS.read().clone();
-        if worker_domains.is_empty() {
+        if Self::target_size() == 0 || worker_domains.is_empty() {
             return;
         }
         // CF worker греем только для DC, которых НЕТ в прямых редиректах.
@@ -710,27 +1053,61 @@ impl CfWorkerPool {
             return;
         }
         for (dc, fallback_dst) in &fallbacks {
-            self.refill_now(*dc, fallback_dst.clone(), worker_domains.clone())
-                .await;
+            self.schedule_refill(*dc, fallback_dst.clone(), worker_domains.clone());
         }
         linfo!("CF worker pool warmup started for {} DC(s)", fallbacks.len());
     }
 
-    pub async fn close_all(&self) {
-        let mut map = self.idle.lock().await;
-        for bucket in map.values_mut() {
-            for e in bucket.drain(..) {
-                tokio::spawn(async move {
-                    e.ws.close().await;
-                });
-            }
+    fn take_all(&self, bump_epoch: bool) -> Vec<RawWebSocket> {
+        let mut st = self.state.lock();
+        if bump_epoch {
+            st.epoch += 1;
         }
+        let sockets = st
+            .slots
+            .values_mut()
+            .flat_map(|slot| slot.bucket.drain(..).map(|e| e.ws))
+            .collect();
+        if bump_epoch {
+            st.slots.clear();
+        }
+        sockets
     }
 
+    /// Закрывает простаивающие соединения, состояние бэкоффа сохраняется.
+    pub async fn close_all(&self) {
+        close_detached(self.take_all(false));
+    }
+
+    /// Полный сброс: соединения, бэкофф, флаги. Задачи прошлого поколения
+    /// после этого ничего не меняют (epoch).
     pub async fn reset(&self) {
-        self.close_all().await;
-        self.idle.lock().await.clear();
-        self.refilling.lock().await.clear();
+        close_detached(self.take_all(true));
+        self.exhausted_until.lock().await.clear();
+    }
+
+    /// Остановка: отмена фоновых задач, ожидание их завершения, закрытие
+    /// всех соединений (аналог _CfWorkerPool.close() из c317406/1636903).
+    pub async fn close(&self) {
+        self.cancel.cancel();
+        let handles: Vec<_> = std::mem::take(&mut *self.tasks.lock());
+        let _ = tokio::time::timeout(CF_WORKER_CLOSE_WAIT, async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        })
+        .await;
+        let closing: Vec<_> = self
+            .take_all(true)
+            .into_iter()
+            .map(|ws| tokio::spawn(async move { ws.close().await }))
+            .collect();
+        let _ = tokio::time::timeout(CF_WORKER_CLOSE_WAIT, async {
+            for handle in closing {
+                let _ = handle.await;
+            }
+        })
+        .await;
         self.exhausted_until.lock().await.clear();
     }
 }
@@ -759,7 +1136,7 @@ impl ProxyPools {
 
     pub async fn close_all(&self) {
         self.ws.close_all().await;
-        self.cf_worker.close_all().await;
+        self.cf_worker.close().await;
     }
 
     pub async fn reset(&self) {
@@ -1147,6 +1524,111 @@ pub async fn bridge_tcp_stream(
 // TCP fallback — порт bridge._tcp_fallback
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Бэкофф TCP fallback — порт proxy/bridge.py (_tcp_failures, _tcp_retry_after,
+// _tcp_connecting из 50c980e). Ключ — (dst, port).
+// ---------------------------------------------------------------------------
+
+pub type TcpBackoffKey = (String, u16);
+
+#[derive(Default)]
+struct TcpBackoffState {
+    // key -> (подряд неудач, monotonic-время, раньше которого не пробовать)
+    failures: HashMap<TcpBackoffKey, (u32, f64)>,
+    connecting: HashSet<TcpBackoffKey>,
+}
+
+pub struct TcpBackoff {
+    state: parking_lot::Mutex<TcpBackoffState>,
+}
+
+/// Снимает отметку «идёт попытка» при выходе из области видимости,
+/// в том числе при отмене задачи посреди connect.
+pub struct TcpAttemptGuard<'a> {
+    backoff: &'a TcpBackoff,
+    key: TcpBackoffKey,
+}
+
+impl Drop for TcpAttemptGuard<'_> {
+    fn drop(&mut self) {
+        self.backoff.state.lock().connecting.remove(&self.key);
+    }
+}
+
+impl TcpBackoff {
+    pub fn new() -> Self {
+        TcpBackoff {
+            state: parking_lot::Mutex::new(TcpBackoffState::default()),
+        }
+    }
+
+    /// `None`, если по ключу уже идёт попытка или не истёк бэкофф.
+    pub fn try_begin(&self, key: &TcpBackoffKey, now: f64) -> Option<TcpAttemptGuard<'_>> {
+        let mut st = self.state.lock();
+        if st.connecting.contains(key) {
+            return None;
+        }
+        if let Some((_, retry_after)) = st.failures.get(key) {
+            if now < *retry_after {
+                return None;
+            }
+        }
+        st.connecting.insert(key.clone());
+        Some(TcpAttemptGuard {
+            backoff: self,
+            key: key.clone(),
+        })
+    }
+
+    /// Фиксирует неудачу и возвращает задержку до следующей попытки.
+    pub fn record_failure(&self, key: &TcpBackoffKey, now: f64) -> f64 {
+        let mut st = self.state.lock();
+        let failures = st.failures.get(key).map(|(n, _)| *n).unwrap_or(0) + 1;
+        let delay = backoff_delay(
+            failures,
+            TCP_BACKOFF_INITIAL,
+            TCP_BACKOFF_MAX,
+            TCP_BACKOFF_MAX_SHIFT,
+        );
+        st.failures.insert(key.clone(), (failures, now + delay));
+        delay
+    }
+
+    pub fn record_success(&self, key: &TcpBackoffKey) {
+        self.state.lock().failures.remove(key);
+    }
+
+    pub fn clear(&self) {
+        let mut st = self.state.lock();
+        st.failures.clear();
+        st.connecting.clear();
+    }
+
+    #[cfg(test)]
+    fn failures(&self, key: &TcpBackoffKey) -> Option<(u32, f64)> {
+        self.state.lock().failures.get(key).copied()
+    }
+
+    #[cfg(test)]
+    fn is_connecting(&self, key: &TcpBackoffKey) -> bool {
+        self.state.lock().connecting.contains(key)
+    }
+}
+
+impl Default for TcpBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub static TCP_BACKOFF: once_cell::sync::Lazy<TcpBackoff> =
+    once_cell::sync::Lazy::new(TcpBackoff::new);
+
+/// Сброс бэкоффа TCP fallback (аналог reset_tcp_backoff() десктопа).
+pub fn reset_tcp_backoff() {
+    TCP_BACKOFF.clear();
+}
+
 pub async fn tcp_fallback<R, W>(
     conn_read: R,
     conn_write: W,
@@ -1161,25 +1643,51 @@ where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
+    let key: TcpBackoffKey = (dst.to_string(), port);
+    let attempt = match TCP_BACKOFF.try_begin(&key, now_monotonic()) {
+        Some(guard) => guard,
+        None => {
+            ldebug!(
+                "[{}] TCP fallback to {}:{} skipped (backoff or connecting)",
+                label, dst, port
+            );
+            return false;
+        }
+    };
     let addr = format!("{}:{}", dst, port);
-    let mut remote =
-        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: {}", label, dst, port, e);
-                return false;
-            }
-            Err(_) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: timeout", label, dst, port);
-                return false;
-            }
-        };
-    let _ = remote.set_nodelay(true);
-
-    STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
-    if remote.write_all(init).await.is_err() {
-        return false;
+    let connected: Result<TcpStream, String> = async {
+        let mut remote =
+            match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => return Err(e.to_string()),
+                Err(_) => return Err("timeout".to_string()),
+            };
+        let _ = remote.set_nodelay(true);
+        remote
+            .write_all(init)
+            .await
+            .map_err(|e| format!("relay init write: {}", e))?;
+        Ok(remote)
     }
+    .await;
+
+    let remote = match connected {
+        Ok(r) => r,
+        Err(e) => {
+            let delay = TCP_BACKOFF.record_failure(&key, now_monotonic());
+            lwarn!(
+                "[{}] TCP fallback to {}:{} failed: {}; retry in {:.0}s",
+                label, dst, port, e, delay
+            );
+            return false;
+        }
+    };
+    // Как в оригинале: отметка «идёт попытка» снимается сразу после
+    // установления соединения, до долгого bridge.
+    drop(attempt);
+    TCP_BACKOFF.record_success(&key);
+    STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
+
     let (clt_dec, clt_enc, tg_enc, tg_dec) = ctx_streams;
     bridge_tcp(
         conn_read,
@@ -1376,8 +1884,7 @@ where
     if use_worker {
         let pooled = pools
             .cf_worker
-            .get(dc, fallback_dst.clone(), worker_domains.clone())
-            .await;
+            .get(dc, fallback_dst.clone(), worker_domains.clone());
         let worker_ws = if let Some((ws, worker_domain)) = pooled {
             linfo!(
                 "[{}] DC{}{} -> CF worker pool hit via {} for {}",
@@ -2234,4 +2741,572 @@ pub fn parse_cidr_pool(cidrs_str: &str) -> HashMap<i32, String> {
         }
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Тесты: бэкофф TCP fallback и пул CF worker.
+// Сценарии пула перенесены из десктопного tests/test_pool.py::CfWorkerPoolTest.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tcp_backoff_tests {
+    use super::*;
+
+    fn key(port: u16) -> TcpBackoffKey {
+        ("192.0.2.1".to_string(), port)
+    }
+
+    #[test]
+    fn skips_while_connecting_and_releases_on_drop() {
+        let backoff = TcpBackoff::new();
+        let k = key(443);
+        let guard = backoff.try_begin(&k, 0.0).expect("first attempt");
+        assert!(backoff.is_connecting(&k));
+        assert!(backoff.try_begin(&k, 0.0).is_none());
+        // другой порт — другой ключ
+        assert!(backoff.try_begin(&key(80), 0.0).is_some());
+        drop(guard);
+        assert!(!backoff.is_connecting(&k));
+        assert!(backoff.try_begin(&k, 0.0).is_some());
+    }
+
+    #[test]
+    fn failures_grow_until_cap_and_success_resets() {
+        let backoff = TcpBackoff::new();
+        let k = key(443);
+        let now = 1000.0;
+        assert_eq!(backoff.record_failure(&k, now), 30.0);
+        assert!(backoff.try_begin(&k, now + 29.9).is_none());
+        assert!(backoff.try_begin(&k, now + 30.0).is_some());
+        assert_eq!(backoff.record_failure(&k, now), 60.0);
+        assert_eq!(backoff.failures(&k), Some((2, now + 60.0)));
+        for _ in 0..10 {
+            backoff.record_failure(&k, now);
+        }
+        assert_eq!(backoff.failures(&k).unwrap().1, now + TCP_BACKOFF_MAX);
+        backoff.record_success(&k);
+        assert_eq!(backoff.failures(&k), None);
+        assert!(backoff.try_begin(&k, now).is_some());
+    }
+
+    #[test]
+    fn clear_drops_failures_and_connecting() {
+        let backoff = TcpBackoff::new();
+        let k = key(443);
+        backoff.record_failure(&k, 0.0);
+        let guard = backoff.try_begin(&key(80), 0.0).unwrap();
+        backoff.clear();
+        assert_eq!(backoff.failures(&k), None);
+        assert!(!backoff.is_connecting(&key(80)));
+        drop(guard); // повторное снятие отметки безопасно
+    }
+
+    fn streams() -> (TrackedStream, TrackedStream, TrackedStream, TrackedStream) {
+        let k = [7u8; 32];
+        let iv = [9u8; 16];
+        (
+            new_aes_ctr(&k, &iv),
+            new_aes_ctr(&k, &iv),
+            new_aes_ctr(&k, &iv),
+            new_aes_ctr(&k, &iv),
+        )
+    }
+
+    #[tokio::test]
+    async fn refused_fallback_sets_backoff_and_next_call_is_skipped() {
+        // Порт, на котором заведомо никто не слушает.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let k: TcpBackoffKey = ("127.0.0.1".to_string(), port);
+        for attempt in 0..2 {
+            let (client, _peer) = tokio::io::duplex(64);
+            let (r, w) = tokio::io::split(client);
+            let started = std::time::Instant::now();
+            let ok = tcp_fallback(
+                r,
+                w,
+                "127.0.0.1",
+                port,
+                &[0u8; 64],
+                format!("test#{}", attempt),
+                streams(),
+                CancellationToken::new(),
+            )
+            .await;
+            assert!(!ok);
+            // Вторая попытка не идёт в сеть: счётчик неудач не растёт.
+            assert_eq!(TCP_BACKOFF.failures(&k).map(|(n, _)| n), Some(1));
+            assert!(!TCP_BACKOFF.is_connecting(&k));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+        TCP_BACKOFF.record_success(&k);
+    }
+}
+
+#[cfg(test)]
+mod cf_worker_pool_tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    const DST: &str = "192.0.2.2";
+
+    // POOL_SIZE и CF_WORKER_DOMAINS — глобальные; тесты пула идут по одному.
+    static POOL_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+
+    struct Globals {
+        pool_size: i32,
+        worker_domains: Vec<String>,
+    }
+
+    impl Globals {
+        fn set(pool_size: i32) -> Self {
+            let saved = Globals {
+                pool_size: POOL_SIZE.load(SeqCst),
+                worker_domains: CF_WORKER_DOMAINS.read().clone(),
+            };
+            POOL_SIZE.store(pool_size, SeqCst);
+            *CF_WORKER_DOMAINS.write() = vec!["worker.example".to_string()];
+            saved
+        }
+    }
+
+    impl Drop for Globals {
+        fn drop(&mut self) {
+            POOL_SIZE.store(self.pool_size, SeqCst);
+            *CF_WORKER_DOMAINS.write() = std::mem::take(&mut self.worker_domains);
+        }
+    }
+
+    fn timings() -> CfWorkerPoolTimings {
+        CfWorkerPoolTimings {
+            max_age: 60.0,
+            check_interval: 0.01,
+            backoff_initial: 60.0,
+            backoff_max: 3600.0,
+            idle_stop: 300.0,
+        }
+    }
+
+    fn domains() -> Vec<String> {
+        vec!["worker.example".to_string()]
+    }
+
+    /// Только DC2 идёт через CF worker (как dc_redirects без DC2 в десктопном тесте).
+    fn dc_opt_without_2() -> HashMap<i32, String> {
+        DC_DEFAULT_IPS
+            .iter()
+            .filter(|(dc, _)| **dc != 2)
+            .map(|(dc, ip)| (*dc, ip.to_string()))
+            .collect()
+    }
+
+    type Script = Arc<parking_lot::Mutex<VecDeque<Option<(RawWebSocket, String)>>>>;
+
+    /// Пул с подменённым connect: очередные ответы берутся из `script`;
+    /// когда сценарий кончился — connect висит до отмены.
+    fn pool(t: CfWorkerPoolTimings) -> (Arc<CfWorkerPool>, Script) {
+        let pool = Arc::new(CfWorkerPool::with_timings(CancellationToken::new(), t));
+        let script: Script = Arc::new(parking_lot::Mutex::new(VecDeque::new()));
+        let s = script.clone();
+        *pool.connect_hook.lock() = Some(Arc::new(move |_dc| {
+            let next = s.lock().pop_front();
+            Box::pin(async move {
+                match next {
+                    Some(answer) => answer,
+                    None => std::future::pending().await,
+                }
+            })
+        }));
+        (pool, script)
+    }
+
+    async fn wait_for(what: &str, mut pred: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !pred() {
+            assert!(std::time::Instant::now() < deadline, "timeout: {}", what);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    async fn assert_peer_closed(mut peer: TcpStream) {
+        let mut buf = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match peer.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => continue, // close-фрейм
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "WS не закрыт");
+    }
+
+    fn calls(pool: &CfWorkerPool) -> usize {
+        pool.connect_calls.load(SeqCst)
+    }
+
+    fn bucket_domains(pool: &CfWorkerPool, dc: i32) -> Vec<String> {
+        pool.state
+            .lock()
+            .slots
+            .get(&dc)
+            .map(|s| s.bucket.iter().map(|e| e.worker_domain.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn with_slot<R>(pool: &CfWorkerPool, dc: i32, f: impl FnOnce(&mut CfWorkerSlot) -> R) -> R {
+        let mut st = pool.state.lock();
+        let slot = st
+            .slots
+            .entry(dc)
+            .or_insert_with(|| CfWorkerSlot::new(now_monotonic()));
+        f(slot)
+    }
+
+    fn push_idle(pool: &CfWorkerPool, dc: i32, ws: RawWebSocket, created: f64, domain: &str) {
+        with_slot(pool, dc, |s| {
+            s.bucket.push_back(CfWorkerEntry {
+                ws,
+                created,
+                worker_domain: domain.to_string(),
+            })
+        });
+    }
+
+    async fn join_tasks(pool: &CfWorkerPool) {
+        let handles: Vec<_> = std::mem::take(&mut *pool.tasks.lock());
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    // Регрессия бага форка: schedule_refill не снимал DC из `refilling`,
+    // и после первого попадания пул больше не пополнялся.
+    #[tokio::test]
+    async fn refills_again_after_every_hit() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let (pool, script) = pool(timings());
+        let (ws1, _p1) = test_ws_pair().await;
+        let (ws2, _p2) = test_ws_pair().await;
+        script.lock().extend([Some((ws1, "one".to_string())), Some((ws2, "two".to_string()))]);
+
+        assert!(pool.get(2, DST.into(), domains()).is_none());
+        wait_for("first refill", || bucket_domains(&pool, 2) == ["one"]).await;
+        let (_, d) = pool.get(2, DST.into(), domains()).expect("hit #1");
+        assert_eq!(d, "one");
+        wait_for("refill after hit", || bucket_domains(&pool, 2) == ["two"]).await;
+        let (_, d) = pool.get(2, DST.into(), domains()).expect("hit #2");
+        assert_eq!(d, "two");
+        // Третий connect висит: пополнение заказано и после второго попадания.
+        wait_for("refill after hit #2", || calls(&pool) == 3).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn failed_warmup_recovers_without_new_client_requests() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let (pool, script) = pool(CfWorkerPoolTimings {
+            backoff_initial: 0.03,
+            ..timings()
+        });
+        let (ready, _peer) = test_ws_pair().await;
+        script.lock().extend([None, Some((ready, "ready".to_string()))]);
+
+        pool.warmup(&dc_opt_without_2()).await;
+        wait_for("failed refill", || {
+            with_slot(&pool, 2, |s| s.failures == 1 && s.refill_after > 0.0 && !s.refilling)
+        })
+        .await;
+        wait_for("recovered", || bucket_domains(&pool, 2) == ["ready"]).await;
+        assert_eq!(calls(&pool), 2);
+        with_slot(&pool, 2, |s| {
+            assert_eq!(s.failures, 0);
+            assert_eq!(s.refill_after, 0.0);
+        });
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn stale_connections_are_replaced() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        // Состояния 'eof', 'exception', 'closing' из десктопного теста
+        // требуют RawWebSocket::is_stale().
+        for state in ["expired", "closed"] {
+            let (pool, script) = pool(timings());
+            let (stale, stale_peer) = test_ws_pair().await;
+            let (ready, _peer) = test_ws_pair().await;
+            let mut created = now_monotonic();
+            if state == "expired" {
+                created -= pool.timings.max_age;
+            } else {
+                stale.closed.store(true, SeqCst);
+            }
+            push_idle(&pool, 2, stale, created, "stale");
+            script.lock().push_back(Some((ready, "ready".to_string())));
+
+            assert!(pool.get(2, DST.into(), domains()).is_none(), "{}", state);
+            wait_for(state, || bucket_domains(&pool, 2) == ["ready"]).await;
+            assert_peer_closed(stale_peer).await;
+            pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_replaces_idle_connection_without_client_requests() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let (pool, script) = pool(CfWorkerPoolTimings {
+            max_age: 0.05,
+            ..timings()
+        });
+        let (stale, stale_peer) = test_ws_pair().await;
+        let (ready, _peer) = test_ws_pair().await;
+        push_idle(&pool, 2, stale, now_monotonic(), "stale");
+        script.lock().push_back(Some((ready, "ready".to_string())));
+
+        pool.warmup(&dc_opt_without_2()).await;
+        assert_peer_closed(stale_peer).await;
+        wait_for("replaced", || bucket_domains(&pool, 2) == ["ready"]).await;
+        assert_eq!(calls(&pool), 1);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_start_only_one_background_connection() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let (pool, _script) = pool(timings()); // connect висит
+        for _ in 0..10 {
+            assert!(pool.get(2, DST.into(), domains()).is_none());
+        }
+        wait_for("dial", || calls(&pool) == 1).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(calls(&pool), 1);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn failed_refills_use_capped_exponential_backoff() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let (pool, script) = pool(CfWorkerPoolTimings {
+            backoff_initial: 1.0,
+            backoff_max: 2.0,
+            ..timings()
+        });
+        let (ready, _peer) = test_ws_pair().await;
+        script
+            .lock()
+            .extend([None, None, None, Some((ready, "ready".to_string()))]);
+        // Ротацию «выключаем», как mock _schedule_rotation в десктопном тесте.
+        with_slot(&pool, 2, |s| s.rotating = true);
+
+        for (failures, delay) in [(1u32, 1.0), (2, 2.0), (3, 2.0)] {
+            with_slot(&pool, 2, |s| s.refill_after = 0.0);
+            let started = now_monotonic();
+            pool.schedule_refill(2, DST.into(), domains());
+            join_tasks(&pool).await;
+            with_slot(&pool, 2, |s| {
+                assert!(!s.refilling, "guard должен снять флаг");
+                assert_eq!(s.failures, failures);
+                assert!(s.refill_after >= started + delay);
+                assert!(s.refill_after <= now_monotonic() + delay);
+            });
+        }
+        with_slot(&pool, 2, |s| s.refill_after = 0.0);
+        pool.schedule_refill(2, DST.into(), domains());
+        join_tasks(&pool).await;
+        assert_eq!(bucket_domains(&pool, 2), ["ready"]);
+        with_slot(&pool, 2, |s| {
+            assert_eq!(s.failures, 0);
+            assert_eq!(s.refill_after, 0.0);
+        });
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn misses_during_backoff_do_not_retry_and_close_cancels_retry() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let (pool, script) = pool(timings()); // backoff_initial = 60 с
+        script.lock().push_back(None);
+
+        pool.warmup(&dc_opt_without_2()).await;
+        wait_for("backoff", || with_slot(&pool, 2, |s| s.failures == 1 && !s.refilling)).await;
+        for _ in 0..10 {
+            assert!(pool.get(2, DST.into(), domains()).is_none());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(calls(&pool), 1);
+        assert!(with_slot(&pool, 2, |s| s.rotating));
+
+        pool.close().await;
+        assert!(pool.state.lock().slots.is_empty());
+        assert!(pool.tasks.lock().is_empty());
+        // После close() пул не запускает новых задач.
+        assert!(pool.get(2, DST.into(), domains()).is_none());
+        assert!(pool.tasks.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hit_does_not_reset_failed_refill_backoff() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let (pool, _script) = pool(timings());
+        let (ready, _peer) = test_ws_pair().await;
+        push_idle(&pool, 2, ready, now_monotonic(), "ready");
+        let retry_at = now_monotonic() + 60.0;
+        with_slot(&pool, 2, |s| {
+            s.failures = 3;
+            s.refill_after = retry_at;
+            s.rotating = true;
+        });
+
+        let (_, d) = pool.get(2, DST.into(), domains()).expect("hit");
+        assert_eq!(d, "ready");
+        with_slot(&pool, 2, |s| {
+            assert_eq!(s.failures, 3);
+            assert_eq!(s.refill_after, retry_at);
+            assert!(!s.refilling);
+        });
+        assert_eq!(calls(&pool), 0);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn zero_size_and_missing_worker_domains_do_not_start_refills() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(0);
+        let (pool, _script) = pool(timings());
+        pool.warmup(&dc_opt_without_2()).await;
+        assert!(pool.get(2, DST.into(), domains()).is_none());
+        assert!(pool.tasks.lock().is_empty());
+
+        POOL_SIZE.store(4, SeqCst);
+        assert!(pool.get(2, DST.into(), Vec::new()).is_none());
+        CF_WORKER_DOMAINS.write().clear();
+        pool.warmup(&dc_opt_without_2()).await;
+        assert!(pool.tasks.lock().is_empty());
+        assert_eq!(calls(&pool), 0);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn close_cancels_refill_and_closes_unclaimed_connections() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(1);
+        let (pool, _script) = pool(timings()); // connect висит до отмены
+        let (idle, idle_peer) = test_ws_pair().await;
+        push_idle(&pool, 2, idle, now_monotonic(), "a.example");
+
+        pool.schedule_refill(4, "192.0.2.4".into(), vec!["b.example".to_string()]);
+        wait_for("dial", || calls(&pool) == 1).await;
+        pool.close().await;
+
+        assert!(pool.state.lock().slots.is_empty());
+        assert!(pool.tasks.lock().is_empty());
+        assert_peer_closed(idle_peer).await;
+    }
+
+    // Android: ротация не живёт без клиентов.
+    #[tokio::test]
+    async fn rotation_pauses_and_closes_pool_when_not_requested() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let (pool, script) = pool(CfWorkerPoolTimings {
+            idle_stop: 0.1,
+            ..timings()
+        });
+        let (first, first_peer) = test_ws_pair().await;
+        script.lock().push_back(Some((first, "first".to_string())));
+
+        assert!(pool.get(2, DST.into(), domains()).is_none());
+        wait_for("refilled", || bucket_domains(&pool, 2) == ["first"]).await;
+        assert!(with_slot(&pool, 2, |s| s.rotating));
+
+        // Клиентов нет: через idle_stop ротация останавливается и закрывает пул.
+        wait_for("paused", || with_slot(&pool, 2, |s| !s.rotating)).await;
+        assert!(bucket_domains(&pool, 2).is_empty());
+        assert_peer_closed(first_peer).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(calls(&pool), 1, "без клиентов новых соединений нет");
+
+        // Следующий запрос возобновляет ротацию и пополнение.
+        let (second, _peer) = test_ws_pair().await;
+        script.lock().push_back(Some((second, "second".to_string())));
+        assert!(pool.get(2, DST.into(), domains()).is_none());
+        wait_for("resumed", || bucket_domains(&pool, 2) == ["second"]).await;
+        assert!(with_slot(&pool, 2, |s| s.rotating));
+        pool.close().await;
+    }
+
+    #[test]
+    fn rotation_tick_wakes_at_earliest_deadline() {
+        let _g = POOL_TEST_LOCK.blocking_lock();
+        let saved = POOL_SIZE.swap(4, SeqCst);
+        let t = CfWorkerPoolTimings {
+            max_age: 100.0,
+            check_interval: 5.0,
+            backoff_initial: 1.0,
+            backoff_max: 3600.0,
+            idle_stop: 300.0,
+        };
+        let pool = CfWorkerPool::with_timings(CancellationToken::new(), t);
+        let now = 1000.0;
+        with_slot(&pool, 2, |s| {
+            s.last_requested = now - 298.0; // пауза через 2 с
+            s.refill_after = now + 3.0;
+        });
+        let tick = pool.rotation_tick(2, 0, now).unwrap();
+        assert!(!tick.idle_stop);
+        assert!(tick.need_refill);
+        assert_eq!(tick.wake_at, now + 2.0);
+
+        with_slot(&pool, 2, |s| s.last_requested = now);
+        assert_eq!(pool.rotation_tick(2, 0, now).unwrap().wake_at, now + 3.0);
+        with_slot(&pool, 2, |s| s.refill_after = 0.0);
+        assert_eq!(pool.rotation_tick(2, 0, now).unwrap().wake_at, now + 5.0);
+
+        with_slot(&pool, 2, |s| s.last_requested = now - 300.0);
+        assert!(pool.rotation_tick(2, 0, now).unwrap().idle_stop);
+        // чужое поколение — тик не выполняется
+        assert!(pool.rotation_tick(2, 1, now).is_none());
+        POOL_SIZE.store(saved, SeqCst);
+    }
+
+    #[tokio::test]
+    async fn refill_finished_after_reset_is_discarded() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let pool = Arc::new(CfWorkerPool::with_timings(CancellationToken::new(), timings()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (late, late_peer) = test_ws_pair().await;
+        let late = Arc::new(parking_lot::Mutex::new(Some(late)));
+        {
+            let release = release.clone();
+            let late = late.clone();
+            *pool.connect_hook.lock() = Some(Arc::new(move |_dc| {
+                let release = release.clone();
+                let ws = late.lock().take();
+                Box::pin(async move {
+                    release.notified().await;
+                    ws.map(|ws| (ws, "late".to_string()))
+                })
+            }));
+        }
+        pool.schedule_refill(2, DST.into(), domains());
+        wait_for("dial", || calls(&pool) == 1).await;
+        pool.reset().await;
+        release.notify_one();
+        assert_peer_closed(late_peer).await;
+        assert!(pool.state.lock().slots.is_empty());
+        pool.close().await;
+    }
 }

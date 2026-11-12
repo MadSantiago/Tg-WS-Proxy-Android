@@ -60,6 +60,28 @@ pub const FRONTING_SNI: &str = "sprinthost.ru";
 // proxy/pool.py::_CfWorkerPool
 pub const CF_WORKER_POOL_MAX_AGE: f64 = 100.0;
 pub const CF_WORKER_PER_DC_LIMIT: usize = 1;
+pub const CF_WORKER_POOL_CHECK_INTERVAL: f64 = 5.0;
+pub const CF_WORKER_REFILL_BACKOFF_INITIAL: f64 = 1.0;
+pub const CF_WORKER_REFILL_BACKOFF_MAX: f64 = 3600.0;
+// Android: ротация пула CF worker останавливается (и пул закрывается), если
+// пул этого DC не запрашивали дольше этого времени. Следующий get() запустит
+// её снова. На десктопе ротация живёт до остановки прокси.
+pub const CF_WORKER_ROTATION_IDLE_STOP: f64 = 300.0;
+
+// Экспонента бэкоффа пулов: delay = initial * 2^min(failures-1, 12).
+pub const POOL_BACKOFF_MAX_SHIFT: u32 = 12;
+
+// proxy/bridge.py::_tcp_fallback — бэкофф TCP fallback на (dst, port).
+pub const TCP_BACKOFF_INITIAL: f64 = 30.0;
+pub const TCP_BACKOFF_MAX: f64 = 3600.0;
+pub const TCP_BACKOFF_MAX_SHIFT: u32 = 7;
+
+/// Экспоненциальная задержка: `min(initial * 2^min(failures-1, max_shift), max)`.
+/// `failures` считается с 1; 0 трактуется как 1.
+pub fn backoff_delay(failures: u32, initial: f64, max: f64, max_shift: u32) -> f64 {
+    let shift = failures.saturating_sub(1).min(max_shift);
+    (initial * f64::from(1u32 << shift)).min(max)
+}
 
 // WS пути — proxy/utils.py
 pub const WS_PATH: &str = "/apiws";
@@ -313,6 +335,7 @@ pub fn is_reserved_start(s: &[u8]) -> bool {
         || s4 == [0xee, 0xee, 0xee, 0xee]
         || s4 == [0xdd, 0xdd, 0xdd, 0xdd]
         || s4 == [0x16, 0x03, 0x01, 0x02]
+        || s4 == b"OPTI"
 }
 
 // ---------------------------------------------------------------------------
@@ -594,4 +617,58 @@ pub fn now_monotonic() -> f64 {
     use std::time::Instant;
     static START: Lazy<Instant> = Lazy::new(Instant::now);
     START.elapsed().as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_starts_cover_all_desktop_prefixes() {
+        // proxy/utils.py::RESERVED_STARTS (с OPTI из c317406).
+        let reserved: [&[u8; 4]; 7] = [
+            b"HEAD",
+            b"POST",
+            b"GET ",
+            &[0xee, 0xee, 0xee, 0xee],
+            &[0xdd, 0xdd, 0xdd, 0xdd],
+            &[0x16, 0x03, 0x01, 0x02],
+            b"OPTI",
+        ];
+        for prefix in reserved {
+            let mut init = [0x42u8; 64];
+            init[..4].copy_from_slice(prefix);
+            assert!(is_reserved_start(&init[..4]), "{:?}", prefix);
+            assert!(is_reserved_start(&init), "{:?} (полный relay_init)", prefix);
+        }
+    }
+
+    #[test]
+    fn reserved_starts_reject_other_prefixes_and_short_input() {
+        for prefix in [b"OPTX", b"OPT\x00", b"GETX", b"opti", b"\x16\x03\x01\x03"] {
+            assert!(!is_reserved_start(prefix), "{:?}", prefix);
+        }
+        assert!(!is_reserved_start(b"OPT"));
+        assert!(!is_reserved_start(b""));
+    }
+
+    #[test]
+    fn backoff_delay_is_capped_exponential() {
+        let pool: Vec<f64> = (1..=15)
+            .map(|f| backoff_delay(f, 1.0, 3600.0, POOL_BACKOFF_MAX_SHIFT))
+            .collect();
+        assert_eq!(&pool[..4], &[1.0, 2.0, 4.0, 8.0]);
+        assert_eq!(pool[12], 3600.0); // 2^12 = 4096 -> потолок 3600
+        assert_eq!(pool[14], 3600.0);
+
+        let tcp: Vec<f64> = (1..=10)
+            .map(|f| backoff_delay(f, TCP_BACKOFF_INITIAL, TCP_BACKOFF_MAX, TCP_BACKOFF_MAX_SHIFT))
+            .collect();
+        assert_eq!(&tcp[..7], &[30.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0]);
+        assert_eq!(tcp[7], 3600.0); // 30 * 2^7 = 3840 -> потолок
+        assert_eq!(tcp[9], 3600.0);
+
+        assert_eq!(backoff_delay(0, 1.0, 2.0, 12), 1.0);
+        assert_eq!(backoff_delay(u32::MAX, 1.0, 2.0, 12), 2.0);
+    }
 }
