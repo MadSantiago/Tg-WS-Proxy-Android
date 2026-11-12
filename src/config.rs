@@ -116,7 +116,30 @@ pub static BUFFER_SIZE: AtomicI32 = AtomicI32::new(256 * 1024);
 pub static POOL_SIZE: AtomicI32 = AtomicI32::new(DEFAULT_POOL_SZ);
 pub static LOG_VERBOSE: AtomicBool = AtomicBool::new(false);
 // proxy/config.py::ProxyConfig — мобильные эквиваленты
-pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(true);
+// Режим «порт 80» (десктоп --no-secure, 8797796). По умолчанию выключен, как
+// на десктопе; приложение передаёт значение явно через SetDisableSecure перед
+// каждым StartProxy. Напрямую не читать — только через
+// cf_use_tls() и port80_fallback_enabled() ниже.
+pub const DISABLE_SECURE_DEFAULT: bool = false;
+pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(DISABLE_SECURE_DEFAULT);
+// По умолчанию — поведение десктопа; «порт 80» включает только приложение.
+const _: () = assert!(!DISABLE_SECURE_DEFAULT);
+
+pub const PORT_TLS: u16 = 443;
+pub const PORT_PLAIN: u16 = 80;
+
+/// CF proxy и CF worker: TLS на 443, в режиме «порт 80» — ws:// на 80
+/// (как --no-secure на десктопе).
+pub fn cf_use_tls() -> bool {
+    !DISABLE_SECURE.load(Ordering::Relaxed)
+}
+
+/// Прямой WS к DC и TCP fallback: всегда сначала 443. В режиме «порт 80»
+/// вторая попытка на 80, если 443 не ответил (таймаут, сброс). Рабочий
+/// вариант запоминается на цель (proxy::port_order).
+pub fn port80_fallback_enabled() -> bool {
+    DISABLE_SECURE.load(Ordering::Relaxed)
+}
 // Проверка TLS-сертификатов WS (по умолчанию включена). Выключается
 // только аварийным рубильником SetTlsVerify(0).
 pub static TLS_VERIFY: AtomicBool = AtomicBool::new(true);

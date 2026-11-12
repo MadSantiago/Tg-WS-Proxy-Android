@@ -84,6 +84,7 @@ pub unsafe extern "C" fn StartProxy(
     tls::log_startup_tls_state();
     cfproxy::clear_cfproxy_429_cooldowns();
     proxy::reset_tcp_backoff();
+    proxy::reset_port_memory();
 
     if secret_str.len() == 32 {
         if hex::decode(&secret_str).is_ok() {
@@ -179,6 +180,7 @@ pub extern "C" fn StopProxy() -> c_int {
     IP_FAIL_UNTIL.write().clear();
     cfproxy::clear_cfproxy_429_cooldowns();
     proxy::reset_tcp_backoff();
+    proxy::reset_port_memory();
     proxy::set_ws_pool_fronting_first(true);
 
     linfo!("StopProxy: exit");
@@ -287,7 +289,9 @@ pub unsafe extern "C" fn SetFakeTlsDomain(c_domain: *const c_char) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SetDisableSecure(v: c_int) {
-    // --no-secure: порт 80 для CF proxy/worker.
+    // Режим «порт 80» (--no-secure): CF proxy/worker на 80; прямой WS и TCP
+    // fallback — 443, затем 80. По умолчанию выключен; приложение передаёт
+    // значение явно перед StartProxy.
     DISABLE_SECURE.store(v != 0, Ordering::Relaxed);
 }
 

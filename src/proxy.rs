@@ -1045,11 +1045,11 @@ impl CfWorkerPool {
                 return hook(dc).await;
             }
         }
-        let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
+        let secure = cf_use_tls();
         let query = format!("dst={}&dc={}", fallback_dst, dc);
         let path = format!("/apiws?{}", query);
         for worker_domain in self.available_domains(worker_domains).await {
-            match ws_connect_full_opts(&worker_domain, &worker_domain, &path, 8.0, None, Some(secure))
+            match ws_connect_full_opts(&worker_domain, &worker_domain, &path, 8.0, None, secure)
                 .await
             {
                 Ok(ws) => return Some((ws, worker_domain)),
@@ -1269,6 +1269,7 @@ impl ProxyPools {
         IP_FAIL_UNTIL.write().clear();
         DC_FAIL_UNTIL.write().clear();
         reset_tcp_backoff();
+        reset_port_memory();
         clear_cfproxy_429_cooldowns();
         set_ws_pool_fronting_first(true);
         if state != 0 && !self.cancel.is_cancelled() {
@@ -1332,7 +1333,12 @@ pub async fn bridge_ws<R, W>(
     let dc_tag = format!("DC{}{}", dc, if is_media { "m" } else { "" });
     let ws = Arc::new(ws);
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
-    let cancel = Arc::new(tokio::sync::Notify::new());
+    // Сигнал «сессия закончена» между задачами. CancellationToken, а не
+    // Notify::notify_waiters: отмена «липкая» и не теряется, если вторая
+    // задача ещё не дошла до ожидания (иначе после EOF клиента сессия
+    // висела до BRIDGE_READ_TIMEOUT). Дочерний токен: отмена сессии не
+    // трогает родительский, а StopProxy отменяет и его.
+    let cancel = cancel_token.child_token();
     let start = now_monotonic();
 
     let mut conn_read = conn_read;
@@ -1349,12 +1355,12 @@ pub async fn bridge_ws<R, W>(
         loop {
             tokio::select! {
                 _ = cancel_token_ping.cancelled() => return,
-                _ = cancel_ping.notified() => return,
+                _ = cancel_ping.cancelled() => return,
                 _ = interval.tick() => {
                     let idle = la_ping.lock().await.elapsed();
                     if idle > BRIDGE_PING_INTERVAL {
                         if ws_ping.send_ping().await.is_err() {
-                            cancel_ping.notify_waiters();
+                            cancel_ping.cancel();
                             return;
                         }
                     }
@@ -1386,7 +1392,7 @@ pub async fn bridge_ws<R, W>(
         loop {
             let read_res = tokio::select! {
                 _ = cancel_token_up.cancelled() => break,
-                _ = cancel_up.notified() => break,
+                _ = cancel_up.cancelled() => break,
                 r = tokio::time::timeout(BRIDGE_READ_TIMEOUT, conn_read.read(&mut buf)) => r,
             };
             let n = match read_res {
@@ -1453,7 +1459,7 @@ pub async fn bridge_ws<R, W>(
                 break;
             }
         }
-        cancel_up.notify_waiters();
+        cancel_up.cancel();
     });
 
     // down: ws -> client
@@ -1471,7 +1477,7 @@ pub async fn bridge_ws<R, W>(
         loop {
             let recv_res = tokio::select! {
                 _ = cancel_token_down.cancelled() => break,
-                _ = cancel_down.notified() => break,
+                _ = cancel_down.cancelled() => break,
                 r = ws_down.recv_with_timeout(BRIDGE_READ_TIMEOUT) => r,
             };
             let mut data = match recv_res {
@@ -1503,12 +1509,12 @@ pub async fn bridge_ws<R, W>(
                 break;
             }
         }
-        cancel_down.notify_waiters();
+        cancel_down.cancel();
     });
 
     let _ = up_task.await;
     let _ = down_task.await;
-    cancel.notify_waiters();
+    cancel.cancel();
     ping_task.abort();
 
     let close_reason = {
@@ -1596,7 +1602,12 @@ pub async fn bridge_tcp<CR, CW>(
     let tg_enc = Arc::new(Mutex::new(tg_enc));
     let tg_dec = Arc::new(Mutex::new(tg_dec));
 
-    let cancel = Arc::new(tokio::sync::Notify::new());
+    // Сигнал «сессия закончена» между задачами. CancellationToken, а не
+    // Notify::notify_waiters: отмена «липкая» и не теряется, если вторая
+    // задача ещё не дошла до ожидания (иначе после EOF клиента сессия
+    // висела до BRIDGE_READ_TIMEOUT). Дочерний токен: отмена сессии не
+    // трогает родительский, а StopProxy отменяет и его.
+    let cancel = cancel_token.child_token();
 
     let cancel_up = cancel.clone();
     let cancel_token_up = cancel_token.clone();
@@ -1607,7 +1618,7 @@ pub async fn bridge_tcp<CR, CW>(
         loop {
             let n = tokio::select! {
                 _ = cancel_token_up.cancelled() => break,
-                _ = cancel_up.notified() => break,
+                _ = cancel_up.cancelled() => break,
                 r = tokio::time::timeout(BRIDGE_READ_TIMEOUT, c_read.read(&mut buf)) => match r {
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => n,
@@ -1622,7 +1633,7 @@ pub async fn bridge_tcp<CR, CW>(
                 break;
             }
         }
-        cancel_up.notify_waiters();
+        cancel_up.cancel();
     };
 
     let cancel_down = cancel.clone();
@@ -1634,7 +1645,7 @@ pub async fn bridge_tcp<CR, CW>(
         loop {
             let n = tokio::select! {
                 _ = cancel_token_down.cancelled() => break,
-                _ = cancel_down.notified() => break,
+                _ = cancel_down.cancelled() => break,
                 r = tokio::time::timeout(BRIDGE_READ_TIMEOUT, r_read.read(&mut buf)) => match r {
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => n,
@@ -1649,7 +1660,7 @@ pub async fn bridge_tcp<CR, CW>(
                 break;
             }
         }
-        cancel_down.notify_waiters();
+        cancel_down.cancel();
     };
 
     tokio::join!(up, down);
@@ -1788,11 +1799,175 @@ pub fn reset_tcp_backoff() {
     TCP_BACKOFF.clear();
 }
 
+// ---------------------------------------------------------------------------
+// Порт 443 → 80 для прямого WS к DC и TCP fallback, с запоминанием
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PortRoute {
+    DirectWs,
+    TcpFallback,
+}
+
+/// Порт, на котором маршрут к цели последний раз заработал. Живёт до конца
+/// сессии прокси; сбрасывается в OnNetworkChanged и StopProxy.
+static WORKING_PORT: once_cell::sync::Lazy<parking_lot::Mutex<HashMap<(PortRoute, String), u16>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Порядок портов для маршрута: всегда сначала 443, как на десктопе; в
+/// режиме «порт 80» затем 80. Запомненный рабочий порт идёт первым, чтобы не
+/// платить таймаутом на каждом соединении.
+pub fn port_order(route: PortRoute, target: &str) -> Vec<u16> {
+    let mut ports = vec![PORT_TLS];
+    if port80_fallback_enabled() {
+        ports.push(PORT_PLAIN);
+    }
+    if let Some(&p) = WORKING_PORT.lock().get(&(route, target.to_string())) {
+        if let Some(i) = ports.iter().position(|&x| x == p) {
+            ports.remove(i);
+            ports.insert(0, p);
+        }
+    }
+    ports
+}
+
+pub fn remember_port(route: PortRoute, target: &str, port: u16) {
+    WORKING_PORT.lock().insert((route, target.to_string()), port);
+}
+
+pub fn reset_port_memory() {
+    WORKING_PORT.lock().clear();
+}
+
+/// Похоже ли на блокировку порта: таймаут или сброс/отказ соединения.
+/// Остальные ошибки (нет сети, ответ сервера) на другой порт не переводят.
+fn is_port_blocking_io_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        TimedOut | ConnectionReset | ConnectionRefused | ConnectionAborted | BrokenPipe | UnexpectedEof
+    )
+}
+
+fn is_port_blocking_ws_error(e: &WsError) -> bool {
+    match e {
+        WsError::Timeout => true,
+        WsError::Io(io) => is_port_blocking_io_error(io),
+        _ => false,
+    }
+}
+
+/// Прямой WS к DC: wss на 443, в режиме «порт 80» — затем ws на 80, если 443
+/// заблокирован. Ответ сервера (в т.ч. 302) возвращается сразу, без смены
+/// порта. Рабочий порт запоминается для `target`.
+pub async fn connect_direct_ws_ports(
+    label: &str,
+    target: &str,
+    domain: &str,
+    path: &str,
+    timeout: f64,
+) -> Result<RawWebSocket, WsError> {
+    let ports = port_order(PortRoute::DirectWs, target);
+    let mut last_err = None;
+    for (i, &port) in ports.iter().enumerate() {
+        match ws_connect_full_opts(target, domain, path, timeout, None, port == PORT_TLS).await {
+            Ok(ws) => {
+                if i > 0 || port != PORT_TLS {
+                    linfo!(
+                        "[{}] WS to {} via {}:{} ({})",
+                        label,
+                        domain,
+                        target,
+                        port,
+                        if port == PORT_TLS { "wss" } else { "ws, без TLS" }
+                    );
+                }
+                remember_port(PortRoute::DirectWs, target, port);
+                return Ok(ws);
+            }
+            Err(e) => {
+                if i + 1 < ports.len() && is_port_blocking_ws_error(&e) {
+                    ldebug!(
+                        "[{}] WS to {} via {}:{} failed ({}), trying port {}",
+                        label,
+                        domain,
+                        target,
+                        port,
+                        e.compact(),
+                        ports[i + 1]
+                    );
+                    last_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or(WsError::Other("no ports".to_string())))
+}
+
+enum TcpAttempt {
+    Connected(TcpStream),
+    Skipped,
+    Failed { blocked: bool },
+}
+
+/// Одна попытка TCP fallback на `dst:port` с бэкоффом: соединение и
+/// отправка relay_init.
+async fn tcp_fallback_attempt(dst: &str, port: u16, init: &[u8], label: &str) -> TcpAttempt {
+    let key: TcpBackoffKey = (dst.to_string(), port);
+    let attempt = match TCP_BACKOFF.try_begin(&key, now_monotonic()) {
+        Some(guard) => guard,
+        None => {
+            ldebug!(
+                "[{}] TCP fallback to {}:{} skipped (backoff or connecting)",
+                label, dst, port
+            );
+            return TcpAttempt::Skipped;
+        }
+    };
+    let addr = format!("{}:{}", dst, port);
+    let connected: Result<TcpStream, std::io::Error> = async {
+        let mut remote =
+            match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
+                Ok(r) => r?,
+                Err(_) => return Err(std::io::ErrorKind::TimedOut.into()),
+            };
+        let _ = remote.set_nodelay(true);
+        remote.write_all(init).await?;
+        Ok(remote)
+    }
+    .await;
+
+    match connected {
+        Ok(remote) => {
+            // Как в оригинале: отметка «идёт попытка» снимается сразу после
+            // установления соединения, до долгого bridge.
+            drop(attempt);
+            TCP_BACKOFF.record_success(&key);
+            TcpAttempt::Connected(remote)
+        }
+        Err(e) => {
+            let delay = TCP_BACKOFF.record_failure(&key, now_monotonic());
+            lwarn!(
+                "[{}] TCP fallback to {}:{} failed: {}; retry in {:.0}s",
+                label, dst, port, e, delay
+            );
+            TcpAttempt::Failed {
+                blocked: is_port_blocking_io_error(&e),
+            }
+        }
+    }
+}
+
+/// TCP fallback: перебирает `ports` по порядку (port_order) и переходит к
+/// следующему, если порт пропущен бэкоффом или похоже заблокирован (таймаут,
+/// сброс). Рабочий порт запоминается для `dst`.
 pub async fn tcp_fallback<R, W>(
     conn_read: R,
     conn_write: W,
     dst: &str,
-    port: u16,
+    ports: &[u16],
     init: &[u8],
     label: String,
     ctx_streams: (TrackedStream, TrackedStream, TrackedStream, TrackedStream),
@@ -1802,49 +1977,25 @@ where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
-    let key: TcpBackoffKey = (dst.to_string(), port);
-    let attempt = match TCP_BACKOFF.try_begin(&key, now_monotonic()) {
-        Some(guard) => guard,
-        None => {
-            ldebug!(
-                "[{}] TCP fallback to {}:{} skipped (backoff or connecting)",
-                label, dst, port
-            );
-            return false;
+    let mut remote = None;
+    for (i, &port) in ports.iter().enumerate() {
+        match tcp_fallback_attempt(dst, port, init, &label).await {
+            TcpAttempt::Connected(r) => {
+                if i > 0 || port != PORT_TLS {
+                    linfo!("[{}] TCP fallback connected to {}:{}", label, dst, port);
+                }
+                remember_port(PortRoute::TcpFallback, dst, port);
+                remote = Some(r);
+                break;
+            }
+            TcpAttempt::Skipped => continue,
+            TcpAttempt::Failed { blocked: true } => continue,
+            TcpAttempt::Failed { blocked: false } => break,
         }
-    };
-    let addr = format!("{}:{}", dst, port);
-    let connected: Result<TcpStream, String> = async {
-        let mut remote =
-            match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => return Err(e.to_string()),
-                Err(_) => return Err("timeout".to_string()),
-            };
-        let _ = remote.set_nodelay(true);
-        remote
-            .write_all(init)
-            .await
-            .map_err(|e| format!("relay init write: {}", e))?;
-        Ok(remote)
     }
-    .await;
-
-    let remote = match connected {
-        Ok(r) => r,
-        Err(e) => {
-            let delay = TCP_BACKOFF.record_failure(&key, now_monotonic());
-            lwarn!(
-                "[{}] TCP fallback to {}:{} failed: {}; retry in {:.0}s",
-                label, dst, port, e, delay
-            );
-            return false;
-        }
+    let Some(remote) = remote else {
+        return false;
     };
-    // Как в оригинале: отметка «идёт попытка» снимается сразу после
-    // установления соединения, до долгого bridge.
-    drop(attempt);
-    TCP_BACKOFF.record_success(&key);
     STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
 
     let (clt_dec, clt_enc, tg_enc, tg_dec) = ctx_streams;
@@ -2036,7 +2187,6 @@ where
     let use_cf = CFPROXY_ENABLED.load(Ordering::Relaxed) && !is_test;
     let worker_domains = CF_WORKER_DOMAINS.read().clone();
     let ws_path = ws_path_for(is_test);
-    let secure_port = if DISABLE_SECURE.load(Ordering::Relaxed) { 80 } else { 443 };
     let use_worker = !worker_domains.is_empty() && !fallback_dst.is_empty() && !is_test;
 
     // Шаг 1: worker-ws (без halves) — порт _cfproxy_worker_fallback.
@@ -2051,7 +2201,7 @@ where
             );
             Some(ws)
         } else {
-            let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
+            let secure = cf_use_tls();
             let query = format!("dst={}&dc={}", fallback_dst, dc);
             let path = format!("/apiws?{}", query);
             let mut found = None;
@@ -2066,7 +2216,7 @@ where
                     &path,
                     10.0,
                     None,
-                    Some(secure),
+                    secure,
                 )
                 .await
                 {
@@ -2142,17 +2292,18 @@ where
         // CF не дал ws — halves НЕ тронуты, идём в TCP fallback ниже.
     }
 
-    // Шаг 3: tcp.
+    // Шаг 3: tcp. Сначала 443, в режиме «порт 80» — затем 80.
     if !fallback_dst.is_empty() {
+        let ports = port_order(PortRoute::TcpFallback, &fallback_dst);
         linfo!(
-            "[{}] DC{}{} -> TCP fallback to {}:{}",
-            label, dc, m_tag, fallback_dst, secure_port
+            "[{}] DC{}{} -> TCP fallback to {} (ports {:?})",
+            label, dc, m_tag, fallback_dst, ports
         );
         return tcp_fallback(
             conn_read,
             conn_write,
             &fallback_dst,
-            secure_port,
+            &ports,
             relay_init,
             label,
             (
@@ -2572,7 +2723,7 @@ async fn serve_core<R, W>(
         for domain in &domains {
             let url = format!("wss://{}{} via {}", domain, ws_path, target);
             linfo!("[{}] DC{}{} -> {}", label, dc, m_tag, url);
-            match ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, None).await {
+            match connect_direct_ws_ports(&label, &target, domain, ws_path, ws_timeout).await {
                 Ok(ws) => {
                     all_redirects = false;
                     ws_opt = Some(ws);
@@ -2789,7 +2940,7 @@ pub async fn connect_direct_ws(
     let mut all_redirects = true;
 
     for dom in domains {
-        match ws_connect_full_opts(target, dom, ws_path, timeout, None, None).await {
+        match connect_direct_ws_ports("retry", target, dom, ws_path, timeout).await {
             Ok(ws) => return (Some(ws), ws_failed_redirect, false),
             Err(WsError::Handshake(h)) => {
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
@@ -2860,8 +3011,8 @@ pub async fn run_proxy(
             CF_WORKER_DOMAINS.read().join(", ")
         );
     }
-    if DISABLE_SECURE.load(Ordering::Relaxed) {
-        linfo!("  No secure:     enabled (port 80 for CF proxy/worker)");
+    if port80_fallback_enabled() {
+        linfo!("  Port 80:       CF proxy/worker on 80; direct WS and TCP fallback 443, then 80");
     }
     if !FAKE_TLS_DOMAIN.read().is_empty() {
         linfo!("  Fake TLS:      {}", FAKE_TLS_DOMAIN.read().clone());
@@ -3018,7 +3169,7 @@ mod tcp_backoff_tests {
                 r,
                 w,
                 "127.0.0.1",
-                port,
+                &[port],
                 &[0u8; 64],
                 format!("test#{}", attempt),
                 streams(),
@@ -3932,13 +4083,13 @@ mod bridge_split_tests {
                 .await
                 .expect("all frames received")
                 .unwrap();
-            // Сессию завершаем токеном: после EOF клиента bridge_ws может
-            // ждать ответа Telegram до BRIDGE_READ_TIMEOUT.
-            cancel.cancel();
+            // После EOF клиента сессия завершается сама, не дожидаясь
+            // BRIDGE_READ_TIMEOUT (фикс потерянного notify_waiters).
             tokio::time::timeout(Duration::from_secs(5), bridge)
                 .await
-                .expect("bridge_ws finished")
+                .expect("bridge_ws finished after client EOF")
                 .unwrap();
+            assert!(!cancel.is_cancelled(), "родительский токен не трогается");
             let mut decoder = encryptor(&relay_init);
             let decoded: Vec<Vec<u8>> = sent
                 .into_iter()
@@ -4050,5 +4201,255 @@ mod bad_handshake_drain_tests {
         drop(client);
         tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
         drop(cancel);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Фикс завершения сессий: отмена между задачами моста не теряется
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod bridge_shutdown_tests {
+    use super::*;
+
+    fn streams() -> (TrackedStream, TrackedStream, TrackedStream, TrackedStream) {
+        let k = [3u8; 32];
+        let iv = [5u8; 16];
+        (
+            new_aes_ctr(&k, &iv),
+            new_aes_ctr(&k, &iv),
+            new_aes_ctr(&k, &iv),
+            new_aes_ctr(&k, &iv),
+        )
+    }
+
+    #[tokio::test]
+    async fn ws_session_ends_right_after_client_eof() {
+        // Клиент закрывается сразу, upstream молчит. Раньше down-задача
+        // могла не получить сигнал и ждать 120 с.
+        for _ in 0..20 {
+            let (client, proxy_side) = tokio::io::duplex(1 << 16);
+            drop(client);
+            let (r, w) = tokio::io::split(proxy_side);
+            let (ws, _peer) = test_ws_pair().await;
+            let (a, b, c, d) = streams();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                bridge_ws(r, w, ws, "eof".into(), 2, false, None, a, b, c, d, CancellationToken::new()),
+            )
+            .await
+            .expect("bridge_ws hung after client EOF");
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_session_ends_right_after_client_eof() {
+        for _ in 0..20 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (remote, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+            let _silent_tg = accepted.unwrap().0;
+            let (client, proxy_side) = tokio::io::duplex(1 << 16);
+            drop(client);
+            let (r, w) = tokio::io::split(proxy_side);
+            let (a, b, c, d) = streams();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                bridge_tcp(r, w, remote.unwrap(), a, b, c, d, CancellationToken::new()),
+            )
+            .await
+            .expect("bridge_tcp hung after client EOF");
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_running_ws_session() {
+        let (_client, proxy_side) = tokio::io::duplex(1 << 16);
+        let (r, w) = tokio::io::split(proxy_side);
+        let (ws, _peer) = test_ws_pair().await;
+        let (a, b, c, d) = streams();
+        let stop = CancellationToken::new();
+        let session = tokio::spawn(bridge_ws(r, w, ws, "stop".into(), 2, false, None, a, b, c, d, stop.clone()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!session.is_finished());
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(2), session).await.unwrap().unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Режим «порт 80» — 443, затем 80, с запоминанием рабочего порта
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod port80_tests {
+    use super::*;
+    use crate::config::GLOBAL_STATE_TEST_LOCK;
+
+    struct Port80Mode(bool);
+
+    impl Port80Mode {
+        fn set(on: bool) -> Self {
+            let saved = Port80Mode(DISABLE_SECURE.load(Ordering::SeqCst));
+            DISABLE_SECURE.store(on, Ordering::SeqCst);
+            reset_port_memory();
+            saved
+        }
+    }
+
+    impl Drop for Port80Mode {
+        fn drop(&mut self) {
+            DISABLE_SECURE.store(self.0, Ordering::SeqCst);
+            reset_port_memory();
+        }
+    }
+
+    fn streams() -> (TrackedStream, TrackedStream, TrackedStream, TrackedStream) {
+        let k = [1u8; 32];
+        let iv = [2u8; 16];
+        (new_aes_ctr(&k, &iv), new_aes_ctr(&k, &iv), new_aes_ctr(&k, &iv), new_aes_ctr(&k, &iv))
+    }
+
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn port_order_follows_mode_and_memory() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let ip = "192.0.2.50";
+        {
+            let _m = Port80Mode::set(false);
+            assert!(cf_use_tls());
+            assert_eq!(port_order(PortRoute::DirectWs, ip), [443]);
+            assert_eq!(port_order(PortRoute::TcpFallback, ip), [443]);
+            // Память без режима «порт 80» не включает 80.
+            remember_port(PortRoute::DirectWs, ip, 80);
+            assert_eq!(port_order(PortRoute::DirectWs, ip), [443]);
+        }
+        {
+            let _m = Port80Mode::set(true);
+            assert!(!cf_use_tls());
+            assert_eq!(port_order(PortRoute::DirectWs, ip), [443, 80]);
+            remember_port(PortRoute::DirectWs, ip, 80);
+            assert_eq!(port_order(PortRoute::DirectWs, ip), [80, 443]);
+            // Маршруты и цели запоминаются раздельно.
+            assert_eq!(port_order(PortRoute::TcpFallback, ip), [443, 80]);
+            assert_eq!(port_order(PortRoute::DirectWs, "192.0.2.51"), [443, 80]);
+            // 443 снова заработал — возвращается первым.
+            remember_port(PortRoute::DirectWs, ip, 443);
+            assert_eq!(port_order(PortRoute::DirectWs, ip), [443, 80]);
+            remember_port(PortRoute::DirectWs, ip, 80);
+            reset_port_memory();
+            assert_eq!(port_order(PortRoute::DirectWs, ip), [443, 80]);
+        }
+    }
+
+    #[tokio::test]
+    async fn network_change_forgets_working_ports() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let _m = Port80Mode::set(true);
+        let saved_pool = POOL_SIZE.swap(0, Ordering::SeqCst);
+        remember_port(PortRoute::TcpFallback, "192.0.2.52", 80);
+        let cancel = CancellationToken::new();
+        let pools = Arc::new(ProxyPools::with_network_debounce(cancel.clone(), Duration::from_millis(10)));
+        pools.on_network_changed(1, 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while port_order(PortRoute::TcpFallback, "192.0.2.52") != [443, 80] {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cancel.cancel();
+        POOL_SIZE.store(saved_pool, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn only_timeouts_and_resets_switch_port() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(is_port_blocking_ws_error(&WsError::Io(Error::from(kind))), "{:?}", kind);
+        }
+        assert!(is_port_blocking_ws_error(&WsError::Timeout));
+        // Ответ сервера и прочее — порт рабочий, второй не пробуем.
+        let redirect = WsError::Handshake(crate::ws::WsHandshakeError {
+            status_code: 302,
+            status_line: "HTTP/1.1 302 Found".into(),
+            headers: HashMap::new(),
+            location: String::new(),
+        });
+        assert!(!is_port_blocking_ws_error(&redirect));
+        assert!(!is_port_blocking_ws_error(&WsError::Io(Error::from(ErrorKind::PermissionDenied))));
+        assert!(!is_port_blocking_ws_error(&WsError::Other("x".into())));
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_moves_to_next_port_and_remembers_it() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let _m = Port80Mode::set(true);
+        let dead = closed_port();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alive = listener.local_addr().unwrap().port();
+        let got_init = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut init = [0u8; 64];
+            s.read_exact(&mut init).await.unwrap();
+            init
+        });
+
+        let (client, _peer) = tokio::io::duplex(64);
+        let (r, w) = tokio::io::split(client);
+        let cancel = CancellationToken::new();
+        let session = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                tcp_fallback(r, w, "127.0.0.1", &[dead, alive], &[0x5A; 64], "ports".into(), streams(), cancel)
+                    .await
+            }
+        });
+        let init = tokio::time::timeout(Duration::from_secs(5), got_init).await.unwrap().unwrap();
+        assert_eq!(init, [0x5A; 64]);
+        assert_eq!(
+            WORKING_PORT.lock().get(&(PortRoute::TcpFallback, "127.0.0.1".to_string())),
+            Some(&alive)
+        );
+        // Неудачный порт получил бэкофф, рабочий — нет.
+        assert_eq!(TCP_BACKOFF.failures(&("127.0.0.1".to_string(), dead)).map(|f| f.0), Some(1));
+        assert_eq!(TCP_BACKOFF.failures(&("127.0.0.1".to_string(), alive)), None);
+        cancel.cancel();
+        assert!(tokio::time::timeout(Duration::from_secs(2), session).await.unwrap().unwrap());
+        TCP_BACKOFF.record_success(&("127.0.0.1".to_string(), dead));
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_skips_port_in_backoff() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let dead = closed_port();
+        let key = ("127.0.0.1".to_string(), dead);
+        TCP_BACKOFF.record_failure(&key, now_monotonic());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alive = listener.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move { listener.accept().await.is_ok() });
+        let (client, _peer) = tokio::io::duplex(64);
+        let (r, w) = tokio::io::split(client);
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        let session = tokio::spawn(async move {
+            tcp_fallback(r, w, "127.0.0.1", &[dead, alive], &[0u8; 64], "skip".into(), streams(), c).await
+        });
+        assert!(tokio::time::timeout(Duration::from_secs(5), accepted).await.unwrap().unwrap());
+        // Пропуск по бэкоффу не считается новой неудачей.
+        assert_eq!(TCP_BACKOFF.failures(&key).map(|f| f.0), Some(1));
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
+        TCP_BACKOFF.record_success(&key);
+        reset_port_memory();
     }
 }

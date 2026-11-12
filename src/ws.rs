@@ -750,13 +750,14 @@ async fn read_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String, Ws
 }
 
 // wsConnectOnce — заголовки 1-в-1 как в Python raw_websocket.py (без User-Agent).
+// `secure`: wss на 443 или ws на 80 — всегда явно у вызывающего.
 pub async fn ws_connect_once(
     dial_addr: &str,
     domain: &str,
     path: &str,
     timeout: Duration,
+    secure: bool,
 ) -> Result<RawWebSocket, WsError> {
-    let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
     ws_connect_once_full(dial_addr, domain, path, timeout, None, secure).await
 }
 
@@ -821,27 +822,19 @@ pub async fn ws_connect_once_full(
     handshake_tls(read_half, write_half, domain, path, timeout).await
 }
 
-// wsConnect: пытается ip, при необходимости резолвит DoH
-pub async fn ws_connect(
-    ip: &str,
-    domain: &str,
-    path: &str,
-    timeout: f64,
-) -> Result<RawWebSocket, WsError> {
-    ws_connect_full_opts(ip, domain, path, timeout, None, None).await
-}
-
+// wsConnect: пытается ip, при необходимости резолвит DoH.
+// `secure` обязателен: неявное «как в DISABLE_SECURE» отправляло бы прямой WS
+// к DC на порт 80.
 pub async fn ws_connect_full_opts(
     ip: &str,
     domain: &str,
     path: &str,
     timeout: f64,
     sni: Option<&str>,
-    secure_opt: Option<bool>,
+    secure: bool,
 ) -> Result<RawWebSocket, WsError> {
     let path = if path.is_empty() { WS_PATH } else { path };
     let attempt_timeout = ws_connect_timeout(timeout);
-    let secure = secure_opt.unwrap_or(!DISABLE_SECURE.load(Ordering::Relaxed));
 
     let primary_addr = if ip.trim().is_empty() {
         domain.to_string()
@@ -892,7 +885,7 @@ pub async fn connect_one_ws_full(
                 return Some(ws);
             }
         }
-        match ws_connect_full_opts(ip, d, path, timeout, None, Some(true)).await {
+        match ws_connect_full_opts(ip, d, path, timeout, None, true).await {
             Ok(ws) => {
                 crate::proxy::set_ws_pool_fronting_first(false);
                 return Some(ws);
@@ -920,7 +913,7 @@ pub async fn connect_one_ws_full(
 
 pub async fn connect_fronted(ip: &str, domain: &str, path: &str) -> Option<RawWebSocket> {
     let path = if path.is_empty() { WS_PATH } else { path };
-    match ws_connect_full_opts(ip, domain, path, WS_POOL_FRONTING_TIMEOUT, Some(FRONTING_SNI), Some(true)).await {
+    match ws_connect_full_opts(ip, domain, path, WS_POOL_FRONTING_TIMEOUT, Some(FRONTING_SNI), true).await {
         Ok(ws) => {
             STATS.connections_fronting.fetch_add(1, Ordering::Relaxed);
             crate::proxy::set_ws_pool_fronting_first(true);

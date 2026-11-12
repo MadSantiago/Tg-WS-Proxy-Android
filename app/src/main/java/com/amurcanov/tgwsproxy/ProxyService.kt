@@ -43,6 +43,7 @@ class ProxyService : Service() {
     private var lastCfPriority: Boolean = true
     private var lastCfDomain: String = ""
     private var lastSecretKey: String = ""
+    private var lastDisableSecure: Boolean = SettingsStore.DEFAULT_PORT80_FALLBACK
 
     companion object {
         const val ACTION_START = "com.amurcanov.tgwsproxy.START"
@@ -56,6 +57,7 @@ class ProxyService : Service() {
         const val EXTRA_CFPROXY_PRIORITY = "EXTRA_CFPROXY_PRIORITY"
         const val EXTRA_CFPROXY_DOMAIN = "EXTRA_CFPROXY_DOMAIN"
         const val EXTRA_SECRET_KEY = "EXTRA_SECRET_KEY"
+        const val EXTRA_DISABLE_SECURE = "EXTRA_DISABLE_SECURE"
         
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
@@ -94,7 +96,8 @@ class ProxyService : Service() {
                 val cfPriority = intent.getBooleanExtra(EXTRA_CFPROXY_PRIORITY, true)
                 val cfDomain = intent.getStringExtra(EXTRA_CFPROXY_DOMAIN) ?: ""
                 val secretKey = intent.getStringExtra(EXTRA_SECRET_KEY) ?: ""
-                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey)
+                val disableSecure = intent.getBooleanExtra(EXTRA_DISABLE_SECURE, SettingsStore.DEFAULT_PORT80_FALLBACK)
+                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey, disableSecure)
             }
             ACTION_STOP -> {
                 stopProxy()
@@ -107,7 +110,7 @@ class ProxyService : Service() {
                 // If we had saved params, try to restart
                 if (lastPort > 0 && lastSecretKey.isNotEmpty()) {
                     Log.w(TAG, "Service restarted by system, re-starting proxy")
-                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey)
+                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey, lastDisableSecure)
                 } else {
                     stopSelf()
                 }
@@ -134,7 +137,8 @@ class ProxyService : Service() {
 
     private fun startProxy(bindIp: String, port: Int, ips: String, poolSize: Int = 4,
                            cfEnabled: Boolean = true, cfPriority: Boolean = true,
-                           cfDomain: String = "", secretKey: String = "") {
+                           cfDomain: String = "", secretKey: String = "",
+                           disableSecure: Boolean = SettingsStore.DEFAULT_PORT80_FALLBACK) {
         if (_isRunning.value || stopInProgress) return
         _isVerifiedRunning.value = false
 
@@ -147,6 +151,7 @@ class ProxyService : Service() {
         lastCfPriority = cfPriority
         lastCfDomain = cfDomain
         lastSecretKey = secretKey
+        lastDisableSecure = disableSecure
         notificationStartedAtMs = System.currentTimeMillis()
         lastNotificationContent = getString(R.string.notification_starting)
         lastNotificationAtMs = notificationStartedAtMs
@@ -182,6 +187,8 @@ class ProxyService : Service() {
                 NativeProxy.setPoolSize(poolSize)
                 NativeProxy.setCfProxyCacheDir(cacheDir.absolutePath)
                 NativeProxy.setCfProxyConfig(cfEnabled, cfPriority, cfDomain)
+                // Передаётся при каждом запуске, а не берётся из значения ядра по умолчанию.
+                NativeProxy.setDisableSecure(disableSecure)
                 val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
                 if (result == 0) {
                     serviceScope.launch {
@@ -292,7 +299,8 @@ class ProxyService : Service() {
                 cfEnabled = lastCfEnabled,
                 cfPriority = lastCfPriority,
                 cfDomain = lastCfDomain,
-                secretKey = lastSecretKey
+                secretKey = lastSecretKey,
+                disableSecure = lastDisableSecure
             )
         }
     }

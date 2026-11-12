@@ -22,6 +22,9 @@ class SettingsStore(private val context: Context) {
         private const val LEGACY_DIRECT_DC_IP = "149.154.167.220"
         const val DEFAULT_LOG_SHOW_INFO = true
         const val DEFAULT_LOG_SHOW_ERROR = false
+        // Режим «порт 80» (SetDisableSecure). Включён по умолчанию, как в форке (7c7f168):
+        // CF на 80, прямой WS и TCP fallback — сначала 443, затем 80.
+        const val DEFAULT_PORT80_FALLBACK = true
     }
 
     private object Keys {
@@ -41,6 +44,7 @@ class SettingsStore(private val context: Context) {
         val CUSTOM_CF_DOMAIN = stringPreferencesKey("custom_cf_domain")
         val AUTO_START_ON_BOOT = booleanPreferencesKey("auto_start_on_boot")
         val SECRET_KEY = stringPreferencesKey("secret_key")
+        val PORT80_FALLBACK = booleanPreferencesKey("port80_fallback")
         val LOG_SHOW_DEBUG = booleanPreferencesKey("log_show_debug")
         val LOG_SHOW_INFO = booleanPreferencesKey("log_show_info")
         val LOG_SHOW_ERROR = booleanPreferencesKey("log_show_error")
@@ -87,6 +91,7 @@ class SettingsStore(private val context: Context) {
     val customCfDomain: Flow<String> = context.dataStore.data.map { it[Keys.CUSTOM_CF_DOMAIN] ?: "" }
     val autoStartOnBoot: Flow<Boolean> = context.dataStore.data.map { it[Keys.AUTO_START_ON_BOOT] ?: false }
     val secretKey: Flow<String> = context.dataStore.data.map { it[Keys.SECRET_KEY] ?: "" }
+    val port80Fallback: Flow<Boolean> = context.dataStore.data.map { it[Keys.PORT80_FALLBACK] ?: DEFAULT_PORT80_FALLBACK }
 
     val logShowDebug: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_DEBUG] ?: false }
     val logShowInfo: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_INFO] ?: DEFAULT_LOG_SHOW_INFO }
@@ -105,6 +110,11 @@ class SettingsStore(private val context: Context) {
     val updateDialogLastActionVersion: Flow<String> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION_VERSION] ?: "" }
     val updateDialogLastAction: Flow<String> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION] ?: "" }
     val updateDialogLastActionAt: Flow<Long> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
+
+    /** Сохраняет режим «порт 80». */
+    suspend fun savePort80Fallback(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.PORT80_FALLBACK] = enabled }
+    }
 
     suspend fun saveSecretKey(key: String) {
         context.dataStore.edit { it[Keys.SECRET_KEY] = key }
