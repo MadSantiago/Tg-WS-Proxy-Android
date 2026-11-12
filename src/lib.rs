@@ -183,6 +183,31 @@ pub extern "C" fn StopProxy() -> c_int {
     0
 }
 
+/// Сигнал от `ConnectivityManager.NetworkCallback`.
+/// `state`: 1 — появилась или сменилась сеть по умолчанию, 0 — сеть пропала.
+/// `transport`: 0 неизвестно, 1 Wi-Fi, 2 сотовая, 3 прочее.
+/// Возврат: 0 — принято; -1 — прокси не запущен (или как раз запускается
+/// либо останавливается), вызов проигнорирован.
+///
+/// Не блокирует вызывающий (системный) поток: сброс выполняется в рантайме
+/// после дебаунса 1,5 с.
+#[unsafe(no_mangle)]
+pub extern "C" fn OnNetworkChanged(state: c_int, transport: c_int) -> c_int {
+    // try_lock: StartProxy/StopProxy держат STATE секундами, ждать нельзя.
+    let pools = match state_cell().try_lock() {
+        Some(guard) => match guard.as_ref() {
+            Some(s) => s.pools.clone(),
+            None => return -1,
+        },
+        None => return -1,
+    };
+    let state = if state != 0 { 1 } else { 0 };
+    let transport = if (0..=3).contains(&transport) { transport } else { 0 };
+    let _rt = runtime().enter();
+    pools.on_network_changed(state, transport);
+    0
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn SetPoolSize(size: c_int) {
     // Оригинал: pool_size = max(0, N); 0 отключает преконнект пула.

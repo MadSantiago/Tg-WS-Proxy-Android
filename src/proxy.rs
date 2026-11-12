@@ -8,7 +8,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -133,7 +133,19 @@ pub struct WsPool {
     rotating: Mutex<HashSet<DcSlot>>,
     refill_failures: Mutex<HashMap<DcSlot, (u32, f64)>>,
     cancel_token: CancellationToken,
+    // Поколение пула: reset() его увеличивает, и refill/rotate,
+    // начатые до сброса (например, в старой сети), ничего не меняют.
+    generation: AtomicU64,
+    #[cfg(test)]
+    connect_hook: parking_lot::Mutex<Option<WsConnectHook>>,
 }
+
+#[cfg(test)]
+type WsConnectHook = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RawWebSocket>> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl WsPool {
     pub fn new(cancel_token: CancellationToken) -> WsPool {
@@ -142,7 +154,14 @@ impl WsPool {
             rotating: Mutex::new(HashSet::new()),
             refill_failures: Mutex::new(HashMap::new()),
             cancel_token,
+            generation: AtomicU64::new(0),
+            #[cfg(test)]
+            connect_hook: parking_lot::Mutex::new(None),
         }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     async fn get_slot(&self, slot: DcSlot) -> Arc<SlotState> {
@@ -176,7 +195,8 @@ impl WsPool {
             let mut q = state.queue.lock().await;
             while let Some(entry) = q.pop_front() {
                 let age = now - entry.created;
-                if age > WS_POOL_REUSE_MAX_AGE || entry.ws.is_closed() {
+                // _is_stale из 1636903: возраст, closed, EOF/ошибка/CLOSE.
+                if age > WS_POOL_REUSE_MAX_AGE || entry.ws.is_stale() {
                     let e = entry;
                     tokio::spawn(async move {
                         e.ws.close().await;
@@ -235,7 +255,8 @@ impl WsPool {
             return;
         }
         let pool = self.clone();
-        spawn_refill_task(pool, slot, state, target_ip, domains);
+        let gen = self.generation();
+        spawn_refill_task(pool, slot, state, target_ip, domains, gen);
     }
 
     async fn refill(
@@ -244,6 +265,7 @@ impl WsPool {
         state: Arc<SlotState>,
         target_ip: String,
         domains: Vec<String>,
+        gen: u64,
     ) {
         let _guard = RefillGuard {
             state: state.clone(),
@@ -260,7 +282,16 @@ impl WsPool {
             let target_ip = target_ip.clone();
             let domains = domains.clone();
             let cancel = self.cancel_token.clone();
+            #[cfg(test)]
+            let hook = self.connect_hook.lock().clone();
             handles.push(tokio::spawn(async move {
+                #[cfg(test)]
+                if let Some(hook) = hook {
+                    return tokio::select! {
+                        _ = cancel.cancelled() => None,
+                        r = hook() => r,
+                    };
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => None,
                     r = connect_one_ws(&target_ip, &domains) => r,
@@ -271,6 +302,13 @@ impl WsPool {
         let mut connected = 0;
         for h in handles {
             if let Ok(Some(ws)) = h.await {
+                if self.generation() != gen {
+                    // Пул сброшен (смена сети), пока шло соединение.
+                    tokio::spawn(async move {
+                        ws.close().await;
+                    });
+                    continue;
+                }
                 let now = now_monotonic();
                 let mut q = state.queue.lock().await;
                 if q.len() < 16 {
@@ -285,8 +323,13 @@ impl WsPool {
             }
         }
 
+        if self.generation() != gen {
+            return;
+        }
         if connected > 0 {
             self.report_success(slot.dc, slot.is_media != 0).await;
+            // Успешный WS из пула снимает cooldown IP.
+            ip_cooldown_record_success(&target_ip);
             self.schedule_rotation(slot, target_ip, domains).await;
         } else {
             // Экспоненциальный backoff 1s..3600s как в оригинале.
@@ -335,7 +378,8 @@ impl WsPool {
         }
         let pool = self.clone();
         let cancel = self.cancel_token.clone();
-        spawn_rotate_task(pool, slot, target_ip, domains, cancel);
+        let gen = self.generation();
+        spawn_rotate_task(pool, slot, target_ip, domains, cancel, gen);
     }
 
     async fn rotate(
@@ -344,8 +388,12 @@ impl WsPool {
         target_ip: String,
         domains: Vec<String>,
         cancel: CancellationToken,
+        gen: u64,
     ) {
         loop {
+            if self.generation() != gen {
+                break;
+            }
             // Спим до ближайшего протухания, но не реже CHECK_INTERVAL.
             let sleep_dur = {
                 let map = self.slots.lock().await;
@@ -388,7 +436,7 @@ impl WsPool {
                 let mut ready = VecDeque::with_capacity(q.len());
                 let mut expired = Vec::new();
                 while let Some(e) = q.pop_front() {
-                    if now - e.created >= WS_POOL_REUSE_MAX_AGE || e.ws.is_closed() {
+                    if now - e.created >= WS_POOL_REUSE_MAX_AGE || e.ws.is_stale() {
                         expired.push(e.ws);
                     } else {
                         ready.push_back(e);
@@ -421,7 +469,11 @@ impl WsPool {
                     .await;
             }
         }
-        self.rotating.lock().await.remove(&slot);
+        // После reset() метка ротации принадлежит уже новому поколению.
+        let mut rotating = self.rotating.lock().await;
+        if self.generation() == gen {
+            rotating.remove(&slot);
+        }
     }
 
     pub async fn warmup(self: &Arc<Self>, dc_opt_map: &HashMap<i32, String>) {
@@ -464,10 +516,17 @@ impl WsPool {
         }
     }
 
+    /// Полный сброс: простаивающие сокеты, бэкофф refill, метки ротации.
+    /// Поколение +1, поэтому задачи, начатые до сброса, свои сокеты
+    /// закрывают, а не кладут в пул.
     pub async fn reset(&self) {
+        {
+            let mut rotating = self.rotating.lock().await;
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            rotating.clear();
+        }
         self.close_all().await;
         self.slots.lock().await.clear();
-        self.rotating.lock().await.clear();
         self.refill_failures.lock().await.clear();
         set_ws_pool_fronting_first(true);
     }
@@ -493,9 +552,10 @@ fn spawn_refill_task(
     state: Arc<SlotState>,
     target_ip: String,
     domains: Vec<String>,
+    gen: u64,
 ) {
     tokio::spawn(async move {
-        pool.refill(slot, state, target_ip, domains).await;
+        pool.refill(slot, state, target_ip, domains, gen).await;
     });
 }
 
@@ -505,9 +565,10 @@ fn spawn_rotate_task(
     target_ip: String,
     domains: Vec<String>,
     cancel: CancellationToken,
+    gen: u64,
 ) {
     tokio::spawn(async move {
-        pool.rotate(slot, target_ip, domains, cancel).await;
+        pool.rotate(slot, target_ip, domains, cancel, gen).await;
     });
 }
 
@@ -675,9 +736,9 @@ impl CfWorkerPool {
         CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize)
     }
 
-    // EOF и ошибка сокета (RawWebSocket::is_stale()) здесь не проверяются.
+    // _is_stale из 1636903: возраст, closed, EOF/ошибка/CLOSE от сервера.
     fn is_stale(&self, entry: &CfWorkerEntry, now: f64) -> bool {
-        now - entry.created >= self.timings.max_age || entry.ws.is_closed()
+        now - entry.created >= self.timings.max_age || entry.ws.is_stale()
     }
 
     fn spawn_tracked<F>(&self, fut: F)
@@ -1119,13 +1180,100 @@ impl CfWorkerPool {
 pub struct ProxyPools {
     pub ws: Arc<WsPool>,
     pub cf_worker: Arc<CfWorkerPool>,
+    cancel: CancellationToken,
+    // Последнее событие сети, ожидающее применения после дебаунса.
+    network_pending: parking_lot::Mutex<Option<(i32, i32)>>,
+    network_debounce: Duration,
+}
+
+/// `transport` из OnNetworkChanged: 0 неизвестно, 1 Wi-Fi, 2 сотовая, 3 прочее.
+pub fn network_transport_name(transport: i32) -> &'static str {
+    match transport {
+        1 => "wifi",
+        2 => "cellular",
+        3 => "other",
+        _ => "unknown",
+    }
 }
 
 impl ProxyPools {
     pub fn new(cancel_token: CancellationToken) -> Self {
+        Self::with_network_debounce(
+            cancel_token,
+            Duration::from_secs_f64(NETWORK_CHANGE_DEBOUNCE),
+        )
+    }
+
+    pub fn with_network_debounce(cancel_token: CancellationToken, debounce: Duration) -> Self {
         ProxyPools {
             ws: Arc::new(WsPool::new(cancel_token.clone())),
-            cf_worker: Arc::new(CfWorkerPool::new(cancel_token)),
+            cf_worker: Arc::new(CfWorkerPool::new(cancel_token.clone())),
+            cancel: cancel_token,
+            network_pending: parking_lot::Mutex::new(None),
+            network_debounce: debounce,
+        }
+    }
+
+    /// Сигнал Android о смене сети по умолчанию (`state` 1) или её
+    /// потере (`state` 0). Не блокирует: ставит отложенную задачу и сразу
+    /// возвращается. События в окне дебаунса сливаются, применяется
+    /// последнее. Вызывать внутри tokio-рантайма.
+    pub fn on_network_changed(self: &Arc<Self>, state: i32, transport: i32) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        {
+            let mut pending = self.network_pending.lock();
+            let scheduled = pending.is_some();
+            *pending = Some((state, transport));
+            if scheduled {
+                ldebug!(
+                    "Network change merged: state={} transport={}",
+                    state,
+                    network_transport_name(transport)
+                );
+                return;
+            }
+        }
+        let pools = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = pools.cancel.cancelled() => {
+                    pools.network_pending.lock().take();
+                    return;
+                }
+                _ = tokio::time::sleep(pools.network_debounce) => {}
+            }
+            let Some((state, transport)) = pools.network_pending.lock().take() else {
+                return;
+            };
+            pools.apply_network_change(state, transport).await;
+        });
+    }
+
+    /// Сброс состояния, привязанного к старой сети. WS_BLACKLIST и активные
+    /// сессии не трогаются.
+    async fn apply_network_change(&self, state: i32, transport: i32) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let idle = self.ws.idle_count().await;
+        linfo!(
+            "Network {} ({}): resetting pools ({} idle WS), cooldowns and backoffs",
+            if state != 0 { "changed" } else { "lost" },
+            network_transport_name(transport),
+            idle
+        );
+        self.ws.reset().await; // + TRY_FRONTING_FIRST = true
+        self.cf_worker.reset().await;
+        IP_FAIL_UNTIL.write().clear();
+        DC_FAIL_UNTIL.write().clear();
+        reset_tcp_backoff();
+        clear_cfproxy_429_cooldowns();
+        set_ws_pool_fronting_first(true);
+        if state != 0 && !self.cancel.is_cancelled() {
+            let dc_opt_map = DC_OPT.read().clone();
+            self.warmup(&dc_opt_map).await;
         }
     }
 
@@ -2285,11 +2433,7 @@ async fn serve_core<R, W>(
     let target = target_opt.unwrap_or_default();
 
     let blacklisted = WS_BLACKLIST.read().get(&dc_key).copied().unwrap_or(false);
-    let ip_cooldown_active = if target.is_empty() {
-        false
-    } else {
-        IP_FAIL_UNTIL.read().get(&target).map(|until| now < *until).unwrap_or(false)
-    };
+    let ip_cooldown_active = !target.is_empty() && ip_cooldown_active(&target, now);
     let is_any_cf_fallback =
         CFPROXY_ENABLED.load(Ordering::Relaxed) || !CF_WORKER_DOMAINS.read().is_empty();
 
@@ -2435,12 +2579,10 @@ async fn serve_core<R, W>(
     // WS failed -> fallback (порт оригинала 1-в-1).
     if ws_opt.is_none() {
         if ws_timed_out && !target.is_empty() {
-            IP_FAIL_UNTIL
-                .write()
-                .insert(target.clone(), now + IP_FAIL_COOLDOWN);
+            let cooldown = ip_cooldown_record_failure(&target, now);
             linfo!(
                 "[{}] DC{}{} WS connect to {} timed out, cooldown for {}s",
-                label, dc, m_tag, target, IP_FAIL_COOLDOWN as i64
+                label, dc, m_tag, target, cooldown as i64
             );
         }
 
@@ -2481,9 +2623,7 @@ async fn serve_core<R, W>(
         return;
     }
 
-    if !target.is_empty() {
-        IP_FAIL_UNTIL.write().remove(&target);
-    }
+    ip_cooldown_record_success(&target);
     pools.ws.report_success(dc, is_media).await;
     STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
 
@@ -2814,6 +2954,7 @@ mod tcp_backoff_tests {
 
     #[tokio::test]
     async fn refused_fallback_sets_backoff_and_next_call_is_skipped() {
+        let _lock = crate::config::GLOBAL_STATE_TEST_LOCK.lock().await;
         // Порт, на котором заведомо никто не слушает.
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2848,13 +2989,12 @@ mod tcp_backoff_tests {
 #[cfg(test)]
 mod cf_worker_pool_tests {
     use super::*;
-    use once_cell::sync::Lazy;
     use std::sync::atomic::Ordering::SeqCst;
 
     const DST: &str = "192.0.2.2";
 
     // POOL_SIZE и CF_WORKER_DOMAINS — глобальные; тесты пула идут по одному.
-    static POOL_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+    use crate::config::GLOBAL_STATE_TEST_LOCK as POOL_TEST_LOCK;
 
     struct Globals {
         pool_size: i32,
@@ -3036,24 +3176,47 @@ mod cf_worker_pool_tests {
     async fn stale_connections_are_replaced() {
         let _lock = POOL_TEST_LOCK.lock().await;
         let _g = Globals::set(4);
-        // Состояния 'eof', 'exception', 'closing' из десктопного теста
-        // требуют RawWebSocket::is_stale().
-        for state in ["expired", "closed"] {
+        // Состояния десктопного теста: expired, closed/closing, eof,
+        // exception (RST), плюс CLOSE-кадр от сервера.
+        for state in ["expired", "closed", "eof", "exception", "close_frame"] {
             let (pool, script) = pool(timings());
-            let (stale, stale_peer) = test_ws_pair().await;
+            let (stale, mut stale_peer) = test_ws_pair().await;
             let (ready, _peer) = test_ws_pair().await;
             let mut created = now_monotonic();
-            if state == "expired" {
-                created -= pool.timings.max_age;
-            } else {
-                stale.closed.store(true, SeqCst);
+            let mut peer_alive = true;
+            match state {
+                "expired" => created -= pool.timings.max_age,
+                "closed" => stale.closed.store(true, SeqCst),
+                "eof" => {
+                    stale_peer.shutdown().await.unwrap();
+                }
+                "exception" => {
+                    stale_peer.set_zero_linger().unwrap();
+                    drop(stale_peer);
+                    peer_alive = false;
+                    stale_peer = test_ws_pair().await.1;
+                }
+                "close_frame" => {
+                    stale_peer
+                        .write_all(&build_frame(OP_CLOSE, &[0x03, 0xE8], false))
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if matches!(state, "eof" | "exception" | "close_frame") {
+                wait_for(state, || stale.is_stale()).await;
+                // Сбрасываем флаг, чтобы проверить именно опрос сокета в get().
+                stale.closed.store(false, SeqCst);
             }
             push_idle(&pool, 2, stale, created, "stale");
             script.lock().push_back(Some((ready, "ready".to_string())));
 
             assert!(pool.get(2, DST.into(), domains()).is_none(), "{}", state);
             wait_for(state, || bucket_domains(&pool, 2) == ["ready"]).await;
-            assert_peer_closed(stale_peer).await;
+            if peer_alive {
+                assert_peer_closed(stale_peer).await;
+            }
             pool.close().await;
         }
     }
@@ -3308,5 +3471,290 @@ mod cf_worker_pool_tests {
         assert_peer_closed(late_peer).await;
         assert!(pool.state.lock().slots.is_empty());
         pool.close().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Тесты: stale-детект в WsPool, поколение пула, OnNetworkChanged
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod network_change_tests {
+    use super::*;
+    use crate::config::GLOBAL_STATE_TEST_LOCK;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    const DST: &str = "192.0.2.2";
+    const DEBOUNCE: Duration = Duration::from_millis(80);
+
+    /// Сохраняет и восстанавливает глобальные настройки, которые трогает тест.
+    struct Globals {
+        pool_size: i32,
+        worker_domains: Vec<String>,
+        dc_opt: HashMap<i32, String>,
+    }
+
+    impl Globals {
+        fn set(pool_size: i32) -> Self {
+            let saved = Globals {
+                pool_size: POOL_SIZE.load(SeqCst),
+                worker_domains: std::mem::take(&mut *CF_WORKER_DOMAINS.write()),
+                dc_opt: DC_OPT.read().clone(),
+            };
+            POOL_SIZE.store(pool_size, SeqCst);
+            *DC_OPT.write() = HashMap::from([(2, DST.to_string())]);
+            saved
+        }
+    }
+
+    impl Drop for Globals {
+        fn drop(&mut self) {
+            POOL_SIZE.store(self.pool_size, SeqCst);
+            *CF_WORKER_DOMAINS.write() = std::mem::take(&mut self.worker_domains);
+            *DC_OPT.write() = std::mem::take(&mut self.dc_opt);
+        }
+    }
+
+    fn slot() -> DcSlot {
+        DcSlot { dc: 2, is_media: 0 }
+    }
+
+    async fn wait_for(what: &str, mut pred: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !pred() {
+            assert!(std::time::Instant::now() < deadline, "timeout: {}", what);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    async fn assert_peer_closed(mut peer: TcpStream) {
+        let mut buf = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match peer.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "WS не закрыт");
+    }
+
+    async fn push_idle(pool: &WsPool, ws: RawWebSocket) {
+        let state = pool.get_slot(slot()).await;
+        state.queue.lock().await.push_back(PoolEntry {
+            ws,
+            created: now_monotonic(),
+        });
+    }
+
+    /// Хук соединений WsPool: считает вызовы и никогда не завершается.
+    fn counting_hook(pool: &WsPool) -> Arc<AtomicUsize> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        *pool.connect_hook.lock() = Some(Arc::new(move || {
+            c.fetch_add(1, SeqCst);
+            Box::pin(std::future::pending())
+        }));
+        calls
+    }
+
+    #[tokio::test]
+    async fn ws_pool_get_skips_socket_closed_by_server() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let _g = Globals::set(0); // без refill
+        let pool = Arc::new(WsPool::new(CancellationToken::new()));
+        let (stale, stale_peer) = test_ws_pair().await;
+        let (fresh, mut fresh_peer) = test_ws_pair().await;
+        drop(stale_peer);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        push_idle(&pool, stale).await;
+        push_idle(&pool, fresh).await;
+
+        let ws = pool.get(2, false, DST.into(), vec![]).await.expect("fresh WS");
+        assert_eq!(pool.idle_count().await, 0);
+        // Выдан именно живой сокет: его пир получает наш кадр.
+        ws.send(b"ping").await.unwrap();
+        let mut buf = [0u8; 2];
+        fresh_peer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[0] & 0x0F, crate::ws::OP_BINARY);
+    }
+
+    #[tokio::test]
+    async fn ws_pool_rotation_drops_socket_closed_by_server() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let _g = Globals::set(2);
+        let pool = Arc::new(WsPool::new(CancellationToken::new()));
+        let calls = counting_hook(&pool);
+        let (stale, stale_peer) = test_ws_pair().await;
+        let (fresh, _fresh_peer) = test_ws_pair().await;
+        push_idle(&pool, stale).await;
+        push_idle(&pool, fresh).await;
+        pool.schedule_rotation(slot(), DST.into(), vec![]).await;
+        drop(stale_peer);
+        // Без запросов клиентов: ротация (раз в WS_POOL_CHECK_INTERVAL)
+        // сама выкидывает сокет, закрытый сервером, и заказывает замену.
+        let deadline = std::time::Instant::now()
+            + Duration::from_secs_f64(WS_POOL_CHECK_INTERVAL + 2.0);
+        while pool.idle_count().await != 1 {
+            assert!(std::time::Instant::now() < deadline, "rotation did not drop stale WS");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        wait_for("refill after stale drop", || calls.load(SeqCst) >= 1).await;
+        pool.cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn ws_pool_refill_finished_after_reset_is_discarded() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let _g = Globals::set(1);
+        let pool = Arc::new(WsPool::new(CancellationToken::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (late, late_peer) = test_ws_pair().await;
+        let late = Arc::new(parking_lot::Mutex::new(Some(late)));
+        {
+            let release = release.clone();
+            let calls = calls.clone();
+            *pool.connect_hook.lock() = Some(Arc::new(move || {
+                calls.fetch_add(1, SeqCst);
+                let release = release.clone();
+                let ws = late.lock().take();
+                Box::pin(async move {
+                    release.notified().await;
+                    ws
+                })
+            }));
+        }
+        pool.schedule_refill(slot(), DST.into(), vec![]).await;
+        wait_for("dial", || calls.load(SeqCst) == 1).await;
+        pool.reset().await;
+        release.notify_one();
+        assert_peer_closed(late_peer).await;
+        assert_eq!(pool.idle_count().await, 0);
+        assert!(pool.refill_failures.lock().await.is_empty());
+        pool.cancel_token.cancel();
+    }
+
+    struct Seeded {
+        ip: String,
+        dc_fail: DcKey,
+        blacklisted: DcKey,
+        tcp: TcpBackoffKey,
+        cf_domain: String,
+    }
+
+    fn seed_network_state() -> Seeded {
+        let s = Seeded {
+            ip: "198.51.100.10".to_string(),
+            dc_fail: DcKey::new(4, false, false),
+            blacklisted: DcKey::new(5, true, false),
+            tcp: ("198.51.100.11".to_string(), 443),
+            cf_domain: "cf.example".to_string(),
+        };
+        ip_cooldown_record_failure(&s.ip, now_monotonic());
+        DC_FAIL_UNTIL.write().insert(s.dc_fail, now_monotonic() + 60.0);
+        WS_BLACKLIST.write().insert(s.blacklisted, true);
+        TCP_BACKOFF.record_failure(&s.tcp, now_monotonic());
+        CFPROXY_429
+            .write()
+            .insert(s.cf_domain.clone(), Cfproxy429State { until: None, strikes: 2 });
+        set_ws_pool_fronting_first(false);
+        s
+    }
+
+    fn assert_network_state_reset(s: &Seeded) {
+        assert!(!IP_FAIL_UNTIL.read().contains_key(&s.ip));
+        assert!(!DC_FAIL_UNTIL.read().contains_key(&s.dc_fail));
+        assert_eq!(TCP_BACKOFF.failures(&s.tcp), None);
+        assert!(!CFPROXY_429.read().contains_key(&s.cf_domain));
+        assert!(ws_pool_fronting_first());
+        // «Все ответы 302» — свойство DC, а не сети: чёрный список остаётся.
+        assert!(WS_BLACKLIST.read().contains_key(&s.blacklisted));
+    }
+
+    fn cleanup(s: &Seeded) {
+        IP_FAIL_UNTIL.write().remove(&s.ip);
+        DC_FAIL_UNTIL.write().remove(&s.dc_fail);
+        WS_BLACKLIST.write().remove(&s.blacklisted);
+        TCP_BACKOFF.record_success(&s.tcp);
+        CFPROXY_429.write().remove(&s.cf_domain);
+        set_ws_pool_fronting_first(true);
+    }
+
+    #[tokio::test]
+    async fn network_change_resets_network_state_and_warms_up() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let _g = Globals::set(1);
+        let cancel = CancellationToken::new();
+        let pools = Arc::new(ProxyPools::with_network_debounce(cancel.clone(), DEBOUNCE));
+        let calls = counting_hook(&pools.ws);
+        let (idle, idle_peer) = test_ws_pair().await;
+        push_idle(&pools.ws, idle).await;
+        let seeded = seed_network_state();
+
+        pools.on_network_changed(1, 2);
+        // До конца дебаунса ничего не сброшено.
+        assert!(IP_FAIL_UNTIL.read().contains_key(&seeded.ip));
+        wait_for("reset", || !IP_FAIL_UNTIL.read().contains_key(&seeded.ip)).await;
+
+        assert_network_state_reset(&seeded);
+        assert_peer_closed(idle_peer).await;
+        // Прогрев после state=1: refill для DC2 (обычный и медиа).
+        wait_for("warmup", || calls.load(SeqCst) == 2).await;
+        cancel.cancel();
+        cleanup(&seeded);
+    }
+
+    #[tokio::test]
+    async fn network_events_within_debounce_are_merged_last_one_wins() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let _g = Globals::set(1);
+        let cancel = CancellationToken::new();
+        let pools = Arc::new(ProxyPools::with_network_debounce(cancel.clone(), DEBOUNCE));
+        let calls = counting_hook(&pools.ws);
+
+        // «Сеть сменилась», сразу «сеть пропала»: применяется только потеря,
+        // без прогрева. Если бы события не сливались, был бы прогрев.
+        let seeded = seed_network_state();
+        pools.on_network_changed(1, 1);
+        pools.on_network_changed(0, 0);
+        wait_for("reset #1", || !IP_FAIL_UNTIL.read().contains_key(&seeded.ip)).await;
+        assert_network_state_reset(&seeded);
+        tokio::time::sleep(DEBOUNCE * 2).await;
+        assert_eq!(calls.load(SeqCst), 0, "state=0 не прогревает пул");
+
+        // Потеря и сразу новая сеть: сброс + прогрев.
+        let seeded = seed_network_state();
+        pools.on_network_changed(0, 0);
+        pools.on_network_changed(1, 2);
+        wait_for("reset #2", || !IP_FAIL_UNTIL.read().contains_key(&seeded.ip)).await;
+        wait_for("warmup", || calls.load(SeqCst) == 2).await;
+        cancel.cancel();
+        cleanup(&seeded);
+    }
+
+    #[tokio::test]
+    async fn pending_network_change_is_dropped_on_stop() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let _g = Globals::set(1);
+        let cancel = CancellationToken::new();
+        let pools = Arc::new(ProxyPools::with_network_debounce(cancel.clone(), DEBOUNCE));
+        let calls = counting_hook(&pools.ws);
+        let seeded = seed_network_state();
+
+        pools.on_network_changed(1, 1);
+        cancel.cancel(); // StopProxy до конца дебаунса
+        tokio::time::sleep(DEBOUNCE * 3).await;
+        assert!(IP_FAIL_UNTIL.read().contains_key(&seeded.ip));
+        assert!(pools.network_pending.lock().is_none());
+
+        pools.on_network_changed(1, 1); // после остановки игнорируется
+        tokio::time::sleep(DEBOUNCE * 3).await;
+        assert!(IP_FAIL_UNTIL.read().contains_key(&seeded.ip));
+        assert_eq!(calls.load(SeqCst), 0);
+        cleanup(&seeded);
     }
 }

@@ -32,6 +32,7 @@ class ProxyService : Service() {
     @Volatile
     private var stopInProgress = false
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var networkMonitor: NetworkChangeMonitor? = null
 
     // Saved intent extras for restart on kill / onTaskRemoved
     private var lastBindIp: String = "127.0.0.1"
@@ -78,6 +79,7 @@ class ProxyService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        networkMonitor = NetworkChangeMonitor(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -186,6 +188,7 @@ class ProxyService : Service() {
                         if (!stopInProgress) {
                             updateRunningState(true)
                             _isVerifiedRunning.value = true
+                            networkMonitor?.start()
                             updateNotification(getString(R.string.notification_running), force = true)
                             Log.i(TAG, "Proxy ready: listening on port $port")
                         }
@@ -274,6 +277,7 @@ class ProxyService : Service() {
 
             statsJob?.cancel()
             statsJob = null
+            networkMonitor?.stop()
 
             requestNativeStop("restart")
             releaseWakeLock()
@@ -326,6 +330,7 @@ class ProxyService : Service() {
         restartJob = null
         statsJob?.cancel()
         statsJob = null
+        networkMonitor?.stop()
         serviceScope.launch {
             updateNotification(getString(R.string.notification_stopping), force = true)
             requestNativeStop("stop")
@@ -505,6 +510,8 @@ class ProxyService : Service() {
         restartJob = null
         statsJob?.cancel()
         statsJob = null
+        networkMonitor?.stop()
+        networkMonitor = null
         releaseWakeLock()
         if (_isRunning.value) {
             updateRunningState(false)

@@ -205,6 +205,36 @@ impl RawWebSocket {
         self.is_closed()
     }
 
+    /// Протух ли простаивающий сокет — аналог проверок `ws._closed`,
+    /// `writer.transport.is_closing()`, `reader.at_eof()` и
+    /// `reader.exception()` из `_is_stale` десктопа (1636903).
+    ///
+    /// Один неблокирующий опрос `fill_buf()` у BufReader: ничего не
+    /// потребляет, поэтому поток кадров не рассинхронизируется. EOF, ошибка
+    /// или кадр CLOSE в начале буфера означают «протух»; Pending или любые
+    /// другие данные — «жив». Если reader сейчас занят (сокет кем-то
+    /// читается), сокет считается живым. Протухший сокет помечается closed.
+    ///
+    /// Проверка возраста (MAX_AGE) остаётся на стороне пулов.
+    pub fn is_stale(&self) -> bool {
+        if self.is_closed() {
+            return true;
+        }
+        let mut reader = match self.reader.try_lock() {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        let stale = match poll_fill_buf_once(&mut reader) {
+            std::task::Poll::Pending => false,
+            std::task::Poll::Ready(Ok(buf)) => buf.is_empty() || (buf[0] & 0x0F) == OP_CLOSE,
+            std::task::Poll::Ready(Err(_)) => true,
+        };
+        if stale {
+            self.closed.store(true, Ordering::Relaxed);
+        }
+        stale
+    }
+
     pub async fn send(&self, data: &[u8]) -> Result<(), WsError> {
         if self.is_closed() {
             return Err(WsError::Other("WebSocket closed".to_string()));
@@ -405,6 +435,30 @@ impl RawWebSocket {
     async fn read_frame(&self) -> Result<(u8, Vec<u8>, bool), WsError> {
         let mut reader = self.reader.lock().await;
         read_frame_match(&mut reader).await
+    }
+}
+
+// Waker, который ничего не делает: нужен для однократного синхронного
+// опроса в is_stale(). Свой, а не Waker::noop(), чтобы не требовать
+// rustc >= 1.85 от локальной сборки .so.
+fn noop_waker() -> std::task::Waker {
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    fn noop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: vtable не обращается к указателю данных.
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+}
+
+fn poll_fill_buf_once(reader: &mut WsReader) -> std::task::Poll<std::io::Result<&[u8]>> {
+    use tokio::io::AsyncBufRead;
+    let waker = noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    match reader {
+        WsReader::Tls(r) => std::pin::Pin::new(r).poll_fill_buf(&mut cx),
+        WsReader::Plain(r) => std::pin::Pin::new(r).poll_fill_buf(&mut cx),
     }
 }
 
@@ -965,4 +1019,71 @@ pub(crate) async fn test_ws_pair() -> (RawWebSocket, TcpStream) {
         secure: false,
     };
     (ws, server.unwrap().0)
+}
+
+#[cfg(test)]
+mod is_stale_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    // Даём ядру доставить FIN/данные до клиентского сокета.
+    async fn settle(ws: &RawWebSocket, expect: bool) -> bool {
+        for _ in 0..100 {
+            if ws.is_stale() == expect {
+                return expect;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        ws.is_stale()
+    }
+
+    #[tokio::test]
+    async fn idle_open_socket_is_not_stale() {
+        let (ws, _server) = test_ws_pair().await;
+        assert!(!ws.is_stale());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!ws.is_stale());
+        assert!(!ws.is_closed());
+    }
+
+    #[tokio::test]
+    async fn eof_from_server_is_stale_and_marks_closed() {
+        let (ws, server) = test_ws_pair().await;
+        drop(server);
+        assert!(settle(&ws, true).await);
+        assert!(ws.is_closed());
+    }
+
+    #[tokio::test]
+    async fn close_frame_from_server_is_stale() {
+        let (ws, mut server) = test_ws_pair().await;
+        server.write_all(&build_frame(OP_CLOSE, &[0x03, 0xE8], false)).await.unwrap();
+        assert!(settle(&ws, true).await);
+    }
+
+    #[tokio::test]
+    async fn data_from_server_is_not_stale_and_frame_stays_readable() {
+        let (ws, mut server) = test_ws_pair().await;
+        server.write_all(&build_frame(OP_BINARY, b"abc", false)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!ws.is_stale());
+        assert!(!ws.is_stale());
+        // fill_buf ничего не потребил: кадр читается целиком.
+        let msg = ws.recv_with_timeout(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(msg, b"abc");
+    }
+
+    #[tokio::test]
+    async fn busy_reader_is_treated_as_alive() {
+        let (ws, _server) = test_ws_pair().await;
+        let _held = ws.reader.lock().await;
+        assert!(!ws.is_stale());
+    }
+
+    #[tokio::test]
+    async fn explicitly_closed_socket_is_stale() {
+        let (ws, _server) = test_ws_pair().await;
+        ws.close().await;
+        assert!(ws.is_stale());
+    }
 }

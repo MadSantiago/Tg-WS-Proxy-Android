@@ -15,7 +15,14 @@ pub const DEFAULT_SEND_BUF: usize = 256 * 1024;
 pub const DEFAULT_POOL_SZ: i32 = 4;
 
 // proxy/tg_ws_proxy.py: IP_FAIL_COOLDOWN / DC_FAIL_COOLDOWN / WS_FAIL_TIMEOUT
-pub const IP_FAIL_COOLDOWN: f64 = 3600.0;
+// Вместо часа после первого же таймаута (десктоп до 50c980e) —
+// растущий cooldown IP: 30 с, удвоение за каждый таймаут подряд, потолок 1 ч.
+pub const IP_FAIL_COOLDOWN_INITIAL: f64 = 30.0;
+pub const IP_FAIL_COOLDOWN_MAX: f64 = 3600.0;
+pub const IP_FAIL_COOLDOWN_MAX_SHIFT: u32 = 7;
+
+// OnNetworkChanged — вызовы чаще этого интервала сливаются в один сброс.
+pub const NETWORK_CHANGE_DEBOUNCE: f64 = 1.5;
 pub const DC_FAIL_COOLDOWN: f64 = 60.0;
 pub const WS_FAIL_TIMEOUT: f64 = 2.0;
 // Прямой WS-коннект при отсутствии cooldown — 5.0 как в оригинале.
@@ -245,8 +252,49 @@ pub static WS_BLACKLIST: Lazy<RwLock<HashMap<DcKey, bool>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 pub static DC_FAIL_UNTIL: Lazy<RwLock<HashMap<DcKey, f64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
-pub static IP_FAIL_UNTIL: Lazy<RwLock<HashMap<String, f64>>> =
+// IP -> (таймаутов подряд, cooldown до). Чистится при успехе WS к этому IP,
+// при смене сети (OnNetworkChanged) и в StopProxy.
+pub static IP_FAIL_UNTIL: Lazy<RwLock<HashMap<String, (u32, f64)>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Тесты, которые меняют глобальное состояние (POOL_SIZE, CF_WORKER_DOMAINS,
+/// IP_FAIL_UNTIL, TCP_BACKOFF и т.п.), идут под этим локом по одному.
+#[cfg(test)]
+pub(crate) static GLOBAL_STATE_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
+    Lazy::new(|| tokio::sync::Mutex::new(()));
+
+pub fn ip_cooldown_active(ip: &str, now: f64) -> bool {
+    IP_FAIL_UNTIL
+        .read()
+        .get(ip)
+        .map(|(_, until)| now < *until)
+        .unwrap_or(false)
+}
+
+/// Таймаут WS к IP: счётчик +1, новый cooldown. Возвращает задержку в секундах.
+pub fn ip_cooldown_record_failure(ip: &str, now: f64) -> f64 {
+    let mut map = IP_FAIL_UNTIL.write();
+    let failures = map.get(ip).map(|(f, _)| *f).unwrap_or(0).saturating_add(1);
+    let delay = backoff_delay(
+        failures,
+        IP_FAIL_COOLDOWN_INITIAL,
+        IP_FAIL_COOLDOWN_MAX,
+        IP_FAIL_COOLDOWN_MAX_SHIFT,
+    );
+    map.insert(ip.to_string(), (failures, now + delay));
+    delay
+}
+
+pub fn ip_cooldown_record_success(ip: &str) {
+    if ip.is_empty() {
+        return;
+    }
+    // Не берём write-лок на каждый успешный WS, если записи нет.
+    if !IP_FAIL_UNTIL.read().contains_key(ip) {
+        return;
+    }
+    IP_FAIL_UNTIL.write().remove(ip);
+}
 
 pub static ZERO64: [u8; 64] = [0u8; 64];
 
@@ -670,5 +718,31 @@ mod tests {
 
         assert_eq!(backoff_delay(0, 1.0, 2.0, 12), 1.0);
         assert_eq!(backoff_delay(u32::MAX, 1.0, 2.0, 12), 2.0);
+    }
+
+    #[test]
+    fn ip_cooldown_grows_from_30s_to_hour_and_success_clears() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.blocking_lock();
+        let ip = "198.51.100.77";
+        IP_FAIL_UNTIL.write().remove(ip);
+        let now = 1000.0;
+        assert!(!ip_cooldown_active(ip, now));
+        let delays: Vec<f64> = (0..9).map(|_| ip_cooldown_record_failure(ip, now)).collect();
+        assert_eq!(delays, [30.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 3600.0, 3600.0]);
+        assert!(ip_cooldown_active(ip, now + 3599.0));
+        assert!(!ip_cooldown_active(ip, now + 3600.0));
+
+        ip_cooldown_record_success(ip);
+        assert!(!ip_cooldown_active(ip, now));
+        assert_eq!(ip_cooldown_record_failure(ip, now), 30.0);
+        IP_FAIL_UNTIL.write().remove(ip);
+    }
+
+    #[test]
+    fn ip_cooldown_success_for_unknown_or_empty_ip_is_noop() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.blocking_lock();
+        ip_cooldown_record_success("");
+        ip_cooldown_record_success("198.51.100.78");
+        assert!(!IP_FAIL_UNTIL.read().contains_key("198.51.100.78"));
     }
 }

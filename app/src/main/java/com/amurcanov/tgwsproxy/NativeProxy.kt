@@ -20,6 +20,7 @@ interface ProxyLibrary : Library {
     fun SetDisableSecure(v: Int)
     fun SetForceTestDc(v: Int)
     fun SetProxyProtocol(v: Int)
+    fun OnNetworkChanged(state: Int, transport: Int): Int
     fun GetSecretWithPrefix(): Pointer?
     fun GetStats(): Pointer?
     fun FreeString(p: Pointer)
@@ -72,6 +73,15 @@ object NativeProxy {
 
     fun setProxyProtocol(v: Boolean) {
         ProxyLibrary.INSTANCE.SetProxyProtocol(if (v) 1 else 0)
+    }
+
+    /**
+     * Сообщает ядру о смене сети по умолчанию (state=1) или её потере (state=0).
+     * transport: 0 неизвестно, 1 Wi-Fi, 2 сотовая, 3 прочее.
+     * Возврат: 0 принято, -1 прокси не запущен. Не блокирует.
+     */
+    fun onNetworkChanged(state: Int, transport: Int): Int {
+        return ProxyLibrary.INSTANCE.OnNetworkChanged(state, transport)
     }
 
     /** Returns the full secret with correct prefix (dd or ee+domain_hex) */
