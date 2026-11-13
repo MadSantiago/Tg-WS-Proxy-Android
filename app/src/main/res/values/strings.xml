@@ -26,6 +26,12 @@
     <string name="autostart">Autostart</string>
     <string name="dc_addresses">Data center addresses</string>
     <string name="media_dcs">Media data centers</string>
+    <string name="experimental_features">Experimental features</string>
+    <string name="tls_verify">TLS certificate verification</string>
+    <string name="tls_verify_hint">Recommended. Turn off only if an antivirus or HTTPS filter replaces certificates and connections fail.</string>
+    <string name="cf_h2_media_hint">Media over one HTTP/2 connection to CloudFlare. Applies on next start.</string>
+    <string name="cf_h2_media_needs_cf">Requires CloudFlare CDN to be enabled.</string>
+    <string name="port80_fallback">Fallback port 80</string>
     <string name="cf_h2_media">Media multiplexing (HTTP/2)</string>
     <string name="experimental_mode">Experimental mode</string>
     <string name="done">Done</string>

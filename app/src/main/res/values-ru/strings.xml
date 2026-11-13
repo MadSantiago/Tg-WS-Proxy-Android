@@ -26,6 +26,12 @@
     <string name="autostart">Автозапуск</string>
     <string name="dc_addresses">Адреса датацентров</string>
     <string name="media_dcs">Медиа датацентры</string>
+    <string name="experimental_features">Экспериментальные функции</string>
+    <string name="tls_verify">Проверка TLS-сертификатов</string>
+    <string name="tls_verify_hint">Рекомендуется. Выключайте, только если антивирус или HTTPS-фильтр подменяет сертификаты и соединения не проходят.</string>
+    <string name="cf_h2_media_hint">Медиа через одно HTTP/2-соединение с CloudFlare. Применяется при следующем запуске.</string>
+    <string name="cf_h2_media_needs_cf">Нужен включённый CloudFlare CDN.</string>
+    <string name="port80_fallback">Резервный порт 80</string>
     <string name="cf_h2_media">Мультиплексирование медиа (HTTP/2)</string>
     <string name="experimental_mode">Экспериментальный режим</string>
     <string name="done">Готово</string>

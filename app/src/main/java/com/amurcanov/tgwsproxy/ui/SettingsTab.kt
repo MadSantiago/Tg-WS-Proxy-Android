@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.SettingsEthernet
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Layers
@@ -92,6 +93,8 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val savedCustomDomain by settingsStore.customCfDomain.collectAsStateWithLifecycle(initialValue = "")
     val autoStartOnBoot by settingsStore.autoStartOnBoot.collectAsStateWithLifecycle(initialValue = false)
     val cfH2Media by settingsStore.cfH2Media.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_CF_H2_MEDIA)
+    val tlsVerify by settingsStore.tlsVerify.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_TLS_VERIFY)
+    val port80Fallback by settingsStore.port80Fallback.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_PORT80_FALLBACK)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
     if (!isReady) {
@@ -410,28 +413,18 @@ fun SettingsTab(settingsStore: SettingsStore) {
                 )
             }
 
-            // Экспериментально: HTTP/2-мультиплексирование медиа через CF
-            // (SetCfH2Media). Применяется при следующем запуске прокси.
-            if (experimentalMode && cfEnabled) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        stringResource(com.amurcanov.tgwsproxy.R.string.cf_h2_media),
-                        modifier = Modifier.weight(1f).padding(start = 28.dp),
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Switch(
-                        checked = cfH2Media,
-                        onCheckedChange = { enabled ->
-                            scope.launch { settingsStore.saveCfH2Media(enabled) }
-                        },
-                        enabled = !isRunning
-                    )
+            // Резервный порт 80 (SetDisableSecure): CF на 80, прямой WS
+            // и TCP fallback — сначала 443, затем 80. Применяется при следующем запуске.
+            SettingSwitchRow(
+                title = stringResource(com.amurcanov.tgwsproxy.R.string.port80_fallback),
+                subtitle = null,
+                icon = Icons.Default.SettingsEthernet,
+                checked = port80Fallback,
+                enabled = !isRunning,
+                onCheckedChange = { enabled ->
+                    scope.launch { settingsStore.savePort80Fallback(enabled) }
                 }
-            }
+            )
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
 
@@ -466,7 +459,100 @@ fun SettingsTab(settingsStore: SettingsStore) {
             }
         }
 
+        // Экспериментальные функции: видны всегда, от экспериментального
+        // режима DC не зависят.
         Spacer(Modifier.height(12.dp))
+
+        AppSectionCard {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(Icons.Default.Settings, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                Text(
+                    stringResource(com.amurcanov.tgwsproxy.R.string.experimental_features),
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            // SetTlsVerify. Выключать только если антивирус или
+            // HTTPS-фильтр подменяет сертификаты и соединения не проходят.
+            SettingSwitchRow(
+                title = stringResource(com.amurcanov.tgwsproxy.R.string.tls_verify),
+                subtitle = stringResource(com.amurcanov.tgwsproxy.R.string.tls_verify_hint),
+                checked = tlsVerify,
+                enabled = !isRunning,
+                onCheckedChange = { enabled ->
+                    scope.launch { settingsStore.saveTlsVerify(enabled) }
+                }
+            )
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+
+            // SetCfH2Media. Без CF-proxy H2 не работает.
+            SettingSwitchRow(
+                title = stringResource(com.amurcanov.tgwsproxy.R.string.cf_h2_media),
+                subtitle = stringResource(
+                    if (cfEnabled) com.amurcanov.tgwsproxy.R.string.cf_h2_media_hint
+                    else com.amurcanov.tgwsproxy.R.string.cf_h2_media_needs_cf
+                ),
+                checked = cfH2Media && cfEnabled,
+                enabled = cfEnabled && !isRunning,
+                onCheckedChange = { enabled ->
+                    scope.launch { settingsStore.saveCfH2Media(enabled) }
+                }
+            )
+        }
+
+        Spacer(Modifier.height(12.dp))
+    }
+}
+
+@Composable
+private fun SettingSwitchRow(
+    title: String,
+    subtitle: String?,
+    checked: Boolean,
+    enabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    icon: androidx.compose.ui.graphics.vector.ImageVector? = null
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (icon != null) {
+            Icon(
+                icon, null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(20.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+        }
+        Column(
+            modifier = Modifier.weight(1f).padding(end = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                title,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = if (enabled) MaterialTheme.colorScheme.onSurface
+                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+            )
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            enabled = enabled
+        )
     }
 }
 

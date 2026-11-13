@@ -33,8 +33,9 @@ object ProxyController {
         val customCfDomain = settingsStore.customCfDomain.first().trim()
         val secretKey = ensureSecretKey(settingsStore)
         val port80Fallback = settingsStore.port80Fallback.first()
-        // Тумблер виден только в экспериментальном режиме и только при CF.
-        val cfH2Media = isExperimental && cfEnabled && settingsStore.cfH2Media.first()
+        // Экспериментальные функции не зависят от экспериментального режима DC.
+        val cfH2Media = cfEnabled && settingsStore.cfH2Media.first()
+        val tlsVerify = settingsStore.tlsVerify.first()
 
         val parsedIps = buildList {
             if (!isDcAuto) {
@@ -73,6 +74,7 @@ object ProxyController {
                 putExtra(ProxyService.EXTRA_SECRET_KEY, secretKey)
                 putExtra(ProxyService.EXTRA_DISABLE_SECURE, port80Fallback)
                 putExtra(ProxyService.EXTRA_CF_H2_MEDIA, cfH2Media)
+                putExtra(ProxyService.EXTRA_TLS_VERIFY, tlsVerify)
             }
         )
         ProxyTileService.requestSync(context)

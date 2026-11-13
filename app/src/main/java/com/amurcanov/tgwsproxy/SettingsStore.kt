@@ -28,6 +28,8 @@ class SettingsStore(private val context: Context) {
         // HTTP/2-мультиплексирование медиа через CF (SetCfH2Media). Экспериментально,
         // действует только при включённом экспериментальном режиме.
         const val DEFAULT_CF_H2_MEDIA = false
+        // Проверка TLS-сертификатов WS (SetTlsVerify), как TLS_VERIFY = true в ядре.
+        const val DEFAULT_TLS_VERIFY = true
     }
 
     private object Keys {
@@ -49,6 +51,7 @@ class SettingsStore(private val context: Context) {
         val SECRET_KEY = stringPreferencesKey("secret_key")
         val PORT80_FALLBACK = booleanPreferencesKey("port80_fallback")
         val CF_H2_MEDIA = booleanPreferencesKey("cf_h2_media")
+        val TLS_VERIFY = booleanPreferencesKey("tls_verify")
         val LOG_SHOW_DEBUG = booleanPreferencesKey("log_show_debug")
         val LOG_SHOW_INFO = booleanPreferencesKey("log_show_info")
         val LOG_SHOW_ERROR = booleanPreferencesKey("log_show_error")
@@ -97,6 +100,7 @@ class SettingsStore(private val context: Context) {
     val secretKey: Flow<String> = context.dataStore.data.map { it[Keys.SECRET_KEY] ?: "" }
     val port80Fallback: Flow<Boolean> = context.dataStore.data.map { it[Keys.PORT80_FALLBACK] ?: DEFAULT_PORT80_FALLBACK }
     val cfH2Media: Flow<Boolean> = context.dataStore.data.map { it[Keys.CF_H2_MEDIA] ?: DEFAULT_CF_H2_MEDIA }
+    val tlsVerify: Flow<Boolean> = context.dataStore.data.map { it[Keys.TLS_VERIFY] ?: DEFAULT_TLS_VERIFY }
 
     val logShowDebug: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_DEBUG] ?: false }
     val logShowInfo: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_INFO] ?: DEFAULT_LOG_SHOW_INFO }
@@ -116,9 +120,12 @@ class SettingsStore(private val context: Context) {
     val updateDialogLastAction: Flow<String> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION] ?: "" }
     val updateDialogLastActionAt: Flow<Long> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
 
-    /** Сохраняет режим «порт 80». */
     suspend fun savePort80Fallback(enabled: Boolean) {
         context.dataStore.edit { it[Keys.PORT80_FALLBACK] = enabled }
+    }
+
+    suspend fun saveTlsVerify(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.TLS_VERIFY] = enabled }
     }
 
     suspend fun saveCfH2Media(enabled: Boolean) {
