@@ -41,6 +41,8 @@
     <string name="cf_worker_domains">CF Worker-домены</string>
     <string name="cf_worker_domains_empty">Введите домен</string>
     <string name="cf_worker_domains_invalid">Есть запись, не похожая на домен.</string>
+    <string name="external_control">Управление прокси извне</string>
+    <string name="external_control_hint">Позволяет другим приложениям запускать и останавливать прокси</string>
     <string name="cf_h2_media">Мультиплексирование медиа (HTTP/2)</string>
     <string name="experimental_mode">Экспериментальный режим</string>
     <string name="done">Готово</string>

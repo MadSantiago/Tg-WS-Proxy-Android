@@ -33,6 +33,8 @@ class SettingsStore(private val context: Context) {
         const val DEFAULT_FAKE_TLS_ENABLED = false
         // Свои Cloudflare Worker (SetCfWorkerDomains): выключено, список пуст.
         const val DEFAULT_CF_WORKER_ENABLED = false
+        // Запуск и остановка прокси другими приложениями (ExternalControl). Выключено.
+        const val DEFAULT_EXTERNAL_CONTROL = false
     }
 
     private object Keys {
@@ -59,6 +61,7 @@ class SettingsStore(private val context: Context) {
         val FAKE_TLS_DOMAIN = stringPreferencesKey("fake_tls_domain")
         val CF_WORKER_ENABLED = booleanPreferencesKey("cf_worker_enabled")
         val CF_WORKER_DOMAINS = stringPreferencesKey("cf_worker_domains")
+        val EXTERNAL_CONTROL = booleanPreferencesKey("external_control")
         val LOG_SHOW_DEBUG = booleanPreferencesKey("log_show_debug")
         val LOG_SHOW_INFO = booleanPreferencesKey("log_show_info")
         val LOG_SHOW_ERROR = booleanPreferencesKey("log_show_error")
@@ -112,6 +115,7 @@ class SettingsStore(private val context: Context) {
     val fakeTlsDomain: Flow<String> = context.dataStore.data.map { it[Keys.FAKE_TLS_DOMAIN] ?: "" }
     val cfWorkerEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.CF_WORKER_ENABLED] ?: DEFAULT_CF_WORKER_ENABLED }
     val cfWorkerDomains: Flow<String> = context.dataStore.data.map { it[Keys.CF_WORKER_DOMAINS] ?: "" }
+    val externalControl: Flow<Boolean> = context.dataStore.data.map { it[Keys.EXTERNAL_CONTROL] ?: DEFAULT_EXTERNAL_CONTROL }
 
     val logShowDebug: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_DEBUG] ?: false }
     val logShowInfo: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_INFO] ?: DEFAULT_LOG_SHOW_INFO }
@@ -145,6 +149,10 @@ class SettingsStore(private val context: Context) {
 
     suspend fun saveCfWorkerDomains(domains: String) {
         context.dataStore.edit { it[Keys.CF_WORKER_DOMAINS] = domains.trim() }
+    }
+
+    suspend fun saveExternalControl(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.EXTERNAL_CONTROL] = enabled }
     }
 
     suspend fun saveFakeTlsEnabled(enabled: Boolean) {

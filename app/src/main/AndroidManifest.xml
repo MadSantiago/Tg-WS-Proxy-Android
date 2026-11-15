@@ -63,6 +63,32 @@
             </intent-filter>
         </activity>
 
+        <!-- Entry points for other apps. All of them do nothing unless the user
+             enables external control in settings. START is an activity (it must be
+             foreground to start the service); STOP and the guard are a receiver. -->
+        <activity
+            android:name="com.amurcanov.tgwsproxy.ExternalControlActivity"
+            android:exported="true"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="com.amurcanov.tgwsproxy.action.START_PROXY" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name="com.amurcanov.tgwsproxy.ExternalControlReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.amurcanov.tgwsproxy.action.STOP_PROXY" />
+                <action android:name="com.amurcanov.tgwsproxy.action.ARM_GUARD" />
+                <action android:name="com.amurcanov.tgwsproxy.action.DISARM_GUARD" />
+            </intent-filter>
+        </receiver>
+
         <service
             android:name="com.amurcanov.tgwsproxy.ProxyService"
             android:exported="false"

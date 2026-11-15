@@ -41,6 +41,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.amurcanov.tgwsproxy.DomainList
+import com.amurcanov.tgwsproxy.ExternalGuard
 import com.amurcanov.tgwsproxy.FakeTls
 import com.amurcanov.tgwsproxy.ProxyService
 import com.amurcanov.tgwsproxy.SettingsStore
@@ -105,6 +106,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val savedFakeTlsDomain by settingsStore.fakeTlsDomain.collectAsStateWithLifecycle(initialValue = "")
     val cfWorkerEnabled by settingsStore.cfWorkerEnabled.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_CF_WORKER_ENABLED)
     val savedCfWorkerDomains by settingsStore.cfWorkerDomains.collectAsStateWithLifecycle(initialValue = "")
+    val externalControl by settingsStore.externalControl.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_EXTERNAL_CONTROL)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
     if (!isReady) {
@@ -617,6 +619,24 @@ fun SettingsTab(settingsStore: SettingsStore) {
                     )
                 )
             }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+
+            // ExternalControlActivity / ExternalControlReceiver: другие приложения
+            // могут запускать и останавливать прокси. Действует сразу, без перезапуска.
+            SettingSwitchRow(
+                title = stringResource(com.amurcanov.tgwsproxy.R.string.external_control),
+                subtitle = stringResource(com.amurcanov.tgwsproxy.R.string.external_control_hint),
+                checked = externalControl,
+                enabled = true,
+                onCheckedChange = { enabled ->
+                    scope.launch {
+                        settingsStore.saveExternalControl(enabled)
+                        // Тумблер выключен: защита от гибели клиента снимается.
+                        if (!enabled) ExternalGuard.disarm()
+                    }
+                }
+            )
         }
 
         Spacer(Modifier.height(12.dp))

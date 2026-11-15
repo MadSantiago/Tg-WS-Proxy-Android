@@ -41,6 +41,8 @@
     <string name="cf_worker_domains">CF Worker domains</string>
     <string name="cf_worker_domains_empty">Enter a domain</string>
     <string name="cf_worker_domains_invalid">Some entry does not look like a domain.</string>
+    <string name="external_control">External proxy control</string>
+    <string name="external_control_hint">Allows other apps to start and stop the proxy</string>
     <string name="cf_h2_media">Media multiplexing (HTTP/2)</string>
     <string name="experimental_mode">Experimental mode</string>
     <string name="done">Done</string>
