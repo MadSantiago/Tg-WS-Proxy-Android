@@ -215,7 +215,7 @@ fun InfoTab(settingsStore: SettingsStore) {
                 Icon(
                     imageVector = Icons.Default.Info,
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
+                    tint = onContainerAccent(),
                     modifier = Modifier.size(18.dp)
                 )
             }
@@ -331,7 +331,7 @@ fun InfoTab(settingsStore: SettingsStore) {
                 Icon(
                     imageVector = Icons.Default.Code,
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
+                    tint = onContainerAccent(),
                     modifier = Modifier.size(18.dp)
                 )
             }
@@ -344,7 +344,7 @@ fun InfoTab(settingsStore: SettingsStore) {
                     Icon(
                         imageVector = Icons.Default.Person,
                         contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
+                        tint = onContainerAccent(),
                         modifier = Modifier.size(18.dp)
                     )
                 }
@@ -358,7 +358,7 @@ fun InfoTab(settingsStore: SettingsStore) {
                     Icon(
                         painter = painterResource(id = R.drawable.ic_github),
                         contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
+                        tint = onContainerAccent(),
                         modifier = Modifier.size(18.dp)
                     )
                 }
@@ -372,7 +372,7 @@ fun InfoTab(settingsStore: SettingsStore) {
                     Icon(
                         imageVector = Icons.Default.Code,
                         contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
+                        tint = onContainerAccent(),
                         modifier = Modifier.size(18.dp)
                     )
                 }
@@ -386,7 +386,7 @@ fun InfoTab(settingsStore: SettingsStore) {
                     Icon(
                         imageVector = Icons.Default.Info,
                         contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
+                        tint = onContainerAccent(),
                         modifier = Modifier.size(18.dp)
                     )
                 }
@@ -530,13 +530,20 @@ fun InfoTab(settingsStore: SettingsStore) {
 private fun InfoHeroCard(onSupportClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     val isDark = colors.background.luminance() < 0.22f
-    val heroBrush = remember(colors.primaryContainer, colors.secondaryContainer, colors.surfaceVariant) {
+    val isBlack = LocalBlackTheme.current
+    val heroBrush = remember(colors.primaryContainer, colors.secondaryContainer, colors.surfaceVariant, isBlack) {
         Brush.linearGradient(
-            listOf(
-                colors.primaryContainer,
-                colors.secondaryContainer,
-                colors.surfaceVariant
-            )
+            if (isBlack) {
+                // У «Чёрной» primaryContainer светлый: градиент из него дал бы
+                // светлую карточку со светлым текстом.
+                BlackThemeColors.heroGradient
+            } else {
+                listOf(
+                    colors.primaryContainer,
+                    colors.secondaryContainer,
+                    colors.surfaceVariant
+                )
+            }
         )
     }
     val glassColor = if (isDark) {

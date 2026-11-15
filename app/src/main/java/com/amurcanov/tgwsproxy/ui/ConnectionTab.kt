@@ -262,7 +262,11 @@ fun ConnectionTab(settingsStore: SettingsStore) {
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = MaterialTheme.colorScheme.primaryContainer,
                                 contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                                disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                                disabledContainerColor = if (LocalBlackTheme.current) {
+                                    BlackThemeColors.buttonDisabled
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                                },
                                 disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f)
                             )
                         ) {

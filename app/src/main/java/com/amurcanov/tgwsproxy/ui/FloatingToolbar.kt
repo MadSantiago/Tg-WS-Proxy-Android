@@ -32,6 +32,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.foundation.isSystemInDarkTheme
 import android.os.Build
 import androidx.compose.foundation.border
 import androidx.compose.ui.platform.LocalContext
@@ -194,6 +196,7 @@ fun FloatingToolbar(
                     val supportsDynamicColor = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                     val showDynamicColorOn = isDynamicColor && supportsDynamicColor
                     val showPalettes = !showDynamicColorOn
+                    val isDarkNow = currentTheme == "dark" || (currentTheme == "system" && isSystemInDarkTheme())
 
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
@@ -227,9 +230,15 @@ fun FloatingToolbar(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceEvenly
                             ) {
-                                PaletteCircle("indigo", 0xFF5B588D, currentPalette, onPaletteChange)
-                                PaletteCircle("forest", 0xFF5F5D68, currentPalette, onPaletteChange)
-                                PaletteCircle("espresso", 0xFF6D4C41, currentPalette, onPaletteChange)
+                                // «Чёрная» есть только у тёмной темы; в светлой выбранная
+                                // «black» отображается как индиго (так её и рисует тема).
+                                val shownPalette = if (currentPalette == "black" && !isDarkNow) "indigo" else currentPalette
+                                PaletteCircle("indigo", 0xFF5B588D, shownPalette, onPaletteChange)
+                                PaletteCircle("forest", 0xFF5F5D68, shownPalette, onPaletteChange)
+                                PaletteCircle("espresso", 0xFF6D4C41, shownPalette, onPaletteChange)
+                                if (isDarkNow) {
+                                    PaletteCircle("black", 0xFF000000, shownPalette, onPaletteChange)
+                                }
                             }
                             Spacer(modifier = Modifier.height(6.dp))
                         }
@@ -293,7 +302,7 @@ private fun ThemeOption(
                     painter = painterResource(id = icon),
                     contentDescription = null,
                     modifier = Modifier.size(18.dp),
-                    tint = if (selected) MaterialTheme.colorScheme.primary
+                    tint = if (selected) onContainerAccent()
                     else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
@@ -301,7 +310,7 @@ private fun ThemeOption(
                 text = label,
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                color = if (selected) MaterialTheme.colorScheme.primary
+                color = if (selected) onContainerAccent()
                 else MaterialTheme.colorScheme.onSurface,
                 fontSize = 13.sp
             )
@@ -324,6 +333,8 @@ fun PaletteCircle(
             .clickable { onClick(paletteId) }
             .then(
                 if (isSelected) Modifier.border(3.dp, MaterialTheme.colorScheme.primary, CircleShape)
+                // Чёрный кружок не виден на тёмной панели без обводки.
+                else if (Color(colorHex).luminance() < 0.05f) Modifier.border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
                 else Modifier
             )
     )

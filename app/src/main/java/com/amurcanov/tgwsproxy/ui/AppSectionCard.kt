@@ -19,6 +19,7 @@ import androidx.compose.ui.unit.dp
 
 @Composable
 private fun appSectionCardColor(): Color {
+    if (LocalBlackTheme.current) return BlackThemeColors.card
     val colors = MaterialTheme.colorScheme
     val isDark = colors.background.luminance() < 0.22f
     return if (isDark) {
@@ -30,6 +31,7 @@ private fun appSectionCardColor(): Color {
 
 @Composable
 private fun appSectionCardBorderColor(): Color {
+    if (LocalBlackTheme.current) return BlackThemeColors.cardBorder
     val colors = MaterialTheme.colorScheme
     val isDark = colors.background.luminance() < 0.22f
     return if (isDark) {

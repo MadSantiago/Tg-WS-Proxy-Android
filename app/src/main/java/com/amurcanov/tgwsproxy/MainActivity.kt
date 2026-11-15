@@ -53,6 +53,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.amurcanov.tgwsproxy.ui.AppUpdateDialog
+import com.amurcanov.tgwsproxy.ui.BlackThemeColors
+import com.amurcanov.tgwsproxy.ui.LocalBlackTheme
 import com.amurcanov.tgwsproxy.ui.ConnectionTab
 import com.amurcanov.tgwsproxy.ui.FloatingToolbar
 import com.amurcanov.tgwsproxy.ui.InfoTab
@@ -109,11 +111,11 @@ class MainActivity : ComponentActivity() {
             val context = LocalContext.current
             val settingsStore = remember { SettingsStore(context) }
             val themeMode by settingsStore.themeMode
-                .collectAsStateWithLifecycle(initialValue = "system")
+                .collectAsStateWithLifecycle(initialValue = "dark")
             val isDynamicColor by settingsStore.isDynamicColor
-                .collectAsStateWithLifecycle(initialValue = true)
+                .collectAsStateWithLifecycle(initialValue = false)
             val themePalette by settingsStore.themePalette
-                .collectAsStateWithLifecycle(initialValue = "indigo")
+                .collectAsStateWithLifecycle(initialValue = "black")
             val scope = rememberCoroutineScope()
 
             LaunchedEffect(settingsStore) {
@@ -367,19 +369,26 @@ private fun ProxyNavigationBar(
 ) {
     val colors = MaterialTheme.colorScheme
     val isDark = colors.background.luminance() < 0.22f
-    val selectedColor = colors.primary
-    val unselectedColor = colors.onSurfaceVariant.copy(alpha = 0.55f)
-    val shellColor = if (isDark) {
+    val isBlack = LocalBlackTheme.current
+    val selectedColor = if (isBlack) BlackThemeColors.navSelected else colors.primary
+    val unselectedColor = if (isBlack) BlackThemeColors.navUnselected else colors.onSurfaceVariant.copy(alpha = 0.55f)
+    val shellColor = if (isBlack) {
+        BlackThemeColors.navShell
+    } else if (isDark) {
         colors.surface.copy(alpha = 0.78f)
     } else {
         lerp(colors.surface, colors.surfaceVariant, 0.48f).copy(alpha = 0.95f)
     }
-    val shellBorder = if (isDark) {
+    val shellBorder = if (isBlack) {
+        BlackThemeColors.navBorder
+    } else if (isDark) {
         colors.outlineVariant.copy(alpha = 0.42f)
     } else {
         colors.outline.copy(alpha = 0.16f)
     }
-    val indicatorColor = if (isDark) {
+    val indicatorColor = if (isBlack) {
+        BlackThemeColors.navIndicator
+    } else if (isDark) {
         colors.primaryContainer.copy(alpha = 0.84f)
     } else {
         lerp(colors.primaryContainer, colors.surface, 0.18f).copy(alpha = 0.97f)
@@ -479,6 +488,41 @@ private fun ProxyNavigationBar(
     }
 }
 
+/** Фон палитры «Чёрная»: чисто чёрный, фигуры едва светлее, без свечения. */
+@Composable
+private fun BlackBackdrop(modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(BlackThemeColors.background)
+    ) {
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .offset(x = (-86).dp, y = (-126).dp)
+                .size(258.dp)
+                .clip(Android16OrbLarge)
+                .background(BlackThemeColors.orbLarge)
+        )
+        Box(
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .offset(x = (-44).dp, y = 28.dp)
+                .size(146.dp)
+                .clip(Android16OrbSmall)
+                .background(BlackThemeColors.orbSmall)
+        )
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .offset(x = 62.dp, y = (-208).dp)
+                .size(198.dp)
+                .clip(Android16OrbMedium)
+                .background(BlackThemeColors.orbMedium)
+        )
+    }
+}
+
 private fun android16OrbShape(points: Int, innerRatio: Float): Shape = GenericShape { size, _ ->
     val centerX = size.width / 2f
     val centerY = size.height / 2f
@@ -501,6 +545,10 @@ private val Android16OrbSmall: Shape = android16OrbShape(points = 16, innerRatio
 
 @Composable
 private fun AppBackdrop(modifier: Modifier = Modifier) {
+    if (LocalBlackTheme.current) {
+        BlackBackdrop(modifier)
+        return
+    }
     val colors = MaterialTheme.colorScheme
     val isDark = colors.background.luminance() < 0.22f
     val baseBrush = remember(colors.background, colors.surface, colors.surfaceVariant) {

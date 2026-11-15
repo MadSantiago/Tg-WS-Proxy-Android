@@ -10,7 +10,9 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
@@ -189,8 +191,80 @@ private val ForestDarkColorScheme = darkColorScheme(
     outlineVariant = Color(0xFF48454E),
 )
 
+// ═══ Палитра «Чёрная» — только для тёмной темы, фон чисто чёрный (AMOLED) ═══
+private val BlackColorScheme = darkColorScheme(
+    primary = Color(0xFFCCCDD1),
+    onPrimary = Color(0xFF0A0C0B),
+    primaryContainer = Color(0xFFE0E1E5),
+    onPrimaryContainer = Color(0xFF0A0A0B),
+    inversePrimary = Color(0xFF46474A),
+    secondary = Color(0xFFA9AAAE),
+    onSecondary = Color(0xFF111112),
+    secondaryContainer = Color(0xFF1A1A1B),
+    onSecondaryContainer = Color(0xFFE2E2E5),
+    tertiary = Color(0xFF8E8F93),
+    onTertiary = Color(0xFF111112),
+    tertiaryContainer = Color(0xFF242425),
+    onTertiaryContainer = Color(0xFFE2E2E5),
+    background = Color(0xFF000000),
+    onBackground = Color(0xFFECECEE),
+    surface = Color(0xFF0A0A0A),
+    onSurface = Color(0xFFECECEE),
+    surfaceVariant = Color(0xFF1E1E1E),
+    onSurfaceVariant = Color(0xFFB5B5B7),
+    // Без оттенка: Surface с tonalElevation остаётся нейтрально-чёрным.
+    surfaceTint = Color(0xFF0A0A0A),
+    inverseSurface = Color(0xFFE6E6E8),
+    inverseOnSurface = Color(0xFF151515),
+    outline = Color(0xFF474747),
+    outlineVariant = Color(0xFF292929),
+    scrim = Color(0xFF000000),
+    surfaceBright = Color(0xFF262626),
+    surfaceDim = Color(0xFF000000),
+    surfaceContainerLowest = Color(0xFF000000),
+    surfaceContainerLow = Color(0xFF070707),
+    surfaceContainer = Color(0xFF0C0C0C),
+    surfaceContainerHigh = Color(0xFF151515),
+    surfaceContainerHighest = Color(0xFF1E1E1E),
+)
+
+/** Палитра «Чёрная» активна: выбрана, тема тёмная, динамические цвета выключены. */
+val LocalBlackTheme = staticCompositionLocalOf { false }
+
+/**
+ * Цвет значка или текста на подложке primaryContainer. У «Чёрной» подложка
+ * светлая, и акцент primary сливается с ней, поэтому берём onPrimaryContainer;
+ * в остальных палитрах — primary.
+ */
+@Composable
+fun onContainerAccent(): Color =
+    if (LocalBlackTheme.current) MaterialTheme.colorScheme.onPrimaryContainer
+    else MaterialTheme.colorScheme.primary
+
+/**
+ * Цвета элементов, которые в других палитрах вычисляются смешиванием
+ * colorScheme (фон, фигуры, карточки, навигация). Для «Чёрной» они заданы
+ * явно.
+ */
+object BlackThemeColors {
+    val background = Color(0xFF000000)
+    val orbLarge = Color(0xFF0E0E0E)
+    val orbSmall = Color(0xFF0B0B0B)
+    val orbMedium = Color(0xFF0B0B0B)
+    val card = Color(0xFF0A0A0A)
+    val cardBorder = Color(0xFF1A1A1A)
+    val navShell = Color(0xFF080808)
+    val navBorder = Color(0xFF161616)
+    val navIndicator = Color(0xFF848486)
+    val navSelected = Color(0xFFF8F8F8)
+    val navUnselected = Color(0xFF7E7E80)
+    val buttonDisabled = Color(0xFF161616)
+    val heroGradient = listOf(Color(0xFF1C1C1E), Color(0xFF121212), Color(0xFF0A0A0A))
+}
+
 private fun getAppColorScheme(palette: String, isDark: Boolean): androidx.compose.material3.ColorScheme {
     return when(palette) {
+        "black" -> if (isDark) BlackColorScheme else IndigoLightColorScheme
         "espresso" -> if (isDark) DarkColorScheme else LightColorScheme
         "forest" -> if (isDark) ForestDarkColorScheme else ForestLightColorScheme
         else -> if (isDark) IndigoDarkColorScheme else IndigoLightColorScheme
@@ -228,19 +302,22 @@ object AppColors {
 
 @Composable
 fun TgWsProxyTheme(
-    themeMode: String = "system",
-    dynamicColor: Boolean = true,
-    themePalette: String = "indigo",
+    themeMode: String = "dark",
+    dynamicColor: Boolean = false,
+    themePalette: String = "black",
     content: @Composable () -> Unit
 ) {
+    val dynamicActive = dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     val darkTheme = when (themeMode) {
         "dark" -> true
         "light" -> false
         else -> isSystemInDarkTheme()
     }
+    // «Чёрная» палитра есть только у тёмной темы; в светлой используется индиго.
+    val isBlack = !dynamicActive && darkTheme && themePalette == "black"
 
     val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+        dynamicActive -> {
             val context = LocalContext.current
             if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         }
@@ -273,9 +350,11 @@ fun TgWsProxyTheme(
         }
     }
 
-    MaterialTheme(
-        colorScheme = colorScheme,
-        typography = TgWsProxyTypography,
-        content = content
-    )
+    CompositionLocalProvider(LocalBlackTheme provides isBlack) {
+        MaterialTheme(
+            colorScheme = colorScheme,
+            typography = TgWsProxyTypography,
+            content = content
+        )
+    }
 }
