@@ -32,6 +32,10 @@
     <string name="cf_h2_media_hint">Media over one HTTP/2 connection to CloudFlare. Applies on next start.</string>
     <string name="cf_h2_media_needs_cf">Requires CloudFlare CDN to be enabled.</string>
     <string name="port80_fallback">Fallback port 80</string>
+    <string name="fake_tls">FakeTLS</string>
+    <string name="fake_tls_hint">Traffic looks like HTTPS to the chosen site. Changes the proxy link – apply it again after enabling.</string>
+    <string name="fake_tls_domain">Masking domain</string>
+    <string name="fake_tls_domain_invalid">Enter a host name</string>
     <string name="cf_h2_media">Media multiplexing (HTTP/2)</string>
     <string name="experimental_mode">Experimental mode</string>
     <string name="done">Done</string>

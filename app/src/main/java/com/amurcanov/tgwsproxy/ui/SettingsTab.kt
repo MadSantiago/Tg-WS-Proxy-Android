@@ -26,7 +26,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -36,6 +40,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.amurcanov.tgwsproxy.FakeTls
 import com.amurcanov.tgwsproxy.ProxyService
 import com.amurcanov.tgwsproxy.SettingsStore
 import kotlinx.coroutines.Job
@@ -95,6 +100,8 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val cfH2Media by settingsStore.cfH2Media.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_CF_H2_MEDIA)
     val tlsVerify by settingsStore.tlsVerify.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_TLS_VERIFY)
     val port80Fallback by settingsStore.port80Fallback.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_PORT80_FALLBACK)
+    val fakeTlsEnabled by settingsStore.fakeTlsEnabled.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_FAKE_TLS_ENABLED)
+    val savedFakeTlsDomain by settingsStore.fakeTlsDomain.collectAsStateWithLifecycle(initialValue = "")
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
     if (!isReady) {
@@ -129,6 +136,12 @@ fun SettingsTab(settingsStore: SettingsStore) {
     var cfEnabled by rememberSaveable(savedCfEnabled) { mutableStateOf(savedCfEnabled) }
     var customCfDomainEnabled by rememberSaveable(savedCustomDomainEnabled) { mutableStateOf(savedCustomDomainEnabled) }
     var customCfDomain by rememberSaveable(savedCustomDomain) { mutableStateOf(savedCustomDomain) }
+    var fakeTlsDomainText by rememberSaveable(savedFakeTlsDomain) { mutableStateOf(savedFakeTlsDomain) }
+    var fakeTlsSaveJob by remember { mutableStateOf<Job?>(null) }
+    // Поля ввода экспериментальных функций сами фокус не отпускают: по тапу
+    // вне поля снимаем его вручную (см. pointerInput корневого Column).
+    val focusManager = LocalFocusManager.current
+    var fakeTlsFocused by remember { mutableStateOf(false) }
     var secretKeyText by remember(savedSecretKey) { mutableStateOf(if (savedSecretKey == "LOADING") "" else savedSecretKey) }
 
     LaunchedEffect(savedSecretKey) {
@@ -182,6 +195,9 @@ fun SettingsTab(settingsStore: SettingsStore) {
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .pointerInput(fakeTlsFocused) {
+                detectTapGestures(onTap = { if (fakeTlsFocused) focusManager.clearFocus() })
+            }
             .verticalScroll(scrollState)
             .padding(start = 16.dp, end = 16.dp, top = 0.dp, bottom = 12.dp)
     ) {
@@ -501,6 +517,52 @@ fun SettingsTab(settingsStore: SettingsStore) {
                     scope.launch { settingsStore.saveCfH2Media(enabled) }
                 }
             )
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+
+            // Fake TLS (SetFakeTlsDomain): клиент говорит с прокси как с
+            // HTTPS-сайтом, чужие и повторённые рукопожатия уходят на домен
+            // маскировки. Меняет секрет в ссылке tg://proxy (ee…).
+            SettingSwitchRow(
+                title = stringResource(com.amurcanov.tgwsproxy.R.string.fake_tls),
+                subtitle = stringResource(com.amurcanov.tgwsproxy.R.string.fake_tls_hint),
+                checked = fakeTlsEnabled,
+                enabled = !isRunning,
+                onCheckedChange = { enabled ->
+                    scope.launch { settingsStore.saveFakeTlsEnabled(enabled) }
+                }
+            )
+            if (fakeTlsEnabled) {
+                val domainValid = FakeTls.normalizeDomain(fakeTlsDomainText) != null
+                OutlinedTextField(
+                    value = fakeTlsDomainText,
+                    onValueChange = { value ->
+                        fakeTlsDomainText = value
+                        fakeTlsSaveJob?.cancel()
+                        fakeTlsSaveJob = scope.launch {
+                            delay(300)
+                            settingsStore.saveFakeTlsDomain(value)
+                        }
+                    },
+                    enabled = !isRunning,
+                    singleLine = true,
+                    isError = !domainValid,
+                    label = { Text(stringResource(com.amurcanov.tgwsproxy.R.string.fake_tls_domain)) },
+                    placeholder = { Text("www.example.com") },
+                    supportingText = if (domainValid) null else {
+                        { Text(stringResource(com.amurcanov.tgwsproxy.R.string.fake_tls_domain_invalid)) }
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onFocusChanged { fakeTlsFocused = it.isFocused },
+                    shape = RoundedCornerShape(24.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+                    )
+                )
+            }
         }
 
         Spacer(Modifier.height(12.dp))
@@ -516,6 +578,7 @@ private fun SettingSwitchRow(
     onCheckedChange: (Boolean) -> Unit,
     icon: androidx.compose.ui.graphics.vector.ImageVector? = null
 ) {
+    val focusManager = LocalFocusManager.current
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -550,7 +613,8 @@ private fun SettingSwitchRow(
         }
         Switch(
             checked = checked,
-            onCheckedChange = onCheckedChange,
+            // Тумблер забирает тап себе, поэтому фокус поля снимаем здесь.
+            onCheckedChange = { focusManager.clearFocus(); onCheckedChange(it) },
             enabled = enabled
         )
     }

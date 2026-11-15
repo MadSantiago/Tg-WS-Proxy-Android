@@ -25,11 +25,12 @@ class SettingsStore(private val context: Context) {
         // Режим «порт 80» (SetDisableSecure). Включён по умолчанию, как в форке (7c7f168):
         // CF на 80, прямой WS и TCP fallback — сначала 443, затем 80.
         const val DEFAULT_PORT80_FALLBACK = true
-        // HTTP/2-мультиплексирование медиа через CF (SetCfH2Media). Экспериментально,
-        // действует только при включённом экспериментальном режиме.
+        // HTTP/2-мультиплексирование медиа через CF (SetCfH2Media). Экспериментально.
         const val DEFAULT_CF_H2_MEDIA = false
         // Проверка TLS-сертификатов WS (SetTlsVerify), как TLS_VERIFY = true в ядре.
         const val DEFAULT_TLS_VERIFY = true
+        // Fake TLS (ee-secret, SetFakeTlsDomain): выключен, домен не задан.
+        const val DEFAULT_FAKE_TLS_ENABLED = false
     }
 
     private object Keys {
@@ -52,6 +53,8 @@ class SettingsStore(private val context: Context) {
         val PORT80_FALLBACK = booleanPreferencesKey("port80_fallback")
         val CF_H2_MEDIA = booleanPreferencesKey("cf_h2_media")
         val TLS_VERIFY = booleanPreferencesKey("tls_verify")
+        val FAKE_TLS_ENABLED = booleanPreferencesKey("fake_tls_enabled")
+        val FAKE_TLS_DOMAIN = stringPreferencesKey("fake_tls_domain")
         val LOG_SHOW_DEBUG = booleanPreferencesKey("log_show_debug")
         val LOG_SHOW_INFO = booleanPreferencesKey("log_show_info")
         val LOG_SHOW_ERROR = booleanPreferencesKey("log_show_error")
@@ -101,6 +104,8 @@ class SettingsStore(private val context: Context) {
     val port80Fallback: Flow<Boolean> = context.dataStore.data.map { it[Keys.PORT80_FALLBACK] ?: DEFAULT_PORT80_FALLBACK }
     val cfH2Media: Flow<Boolean> = context.dataStore.data.map { it[Keys.CF_H2_MEDIA] ?: DEFAULT_CF_H2_MEDIA }
     val tlsVerify: Flow<Boolean> = context.dataStore.data.map { it[Keys.TLS_VERIFY] ?: DEFAULT_TLS_VERIFY }
+    val fakeTlsEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.FAKE_TLS_ENABLED] ?: DEFAULT_FAKE_TLS_ENABLED }
+    val fakeTlsDomain: Flow<String> = context.dataStore.data.map { it[Keys.FAKE_TLS_DOMAIN] ?: "" }
 
     val logShowDebug: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_DEBUG] ?: false }
     val logShowInfo: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_INFO] ?: DEFAULT_LOG_SHOW_INFO }
@@ -126,6 +131,14 @@ class SettingsStore(private val context: Context) {
 
     suspend fun saveTlsVerify(enabled: Boolean) {
         context.dataStore.edit { it[Keys.TLS_VERIFY] = enabled }
+    }
+
+    suspend fun saveFakeTlsEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.FAKE_TLS_ENABLED] = enabled }
+    }
+
+    suspend fun saveFakeTlsDomain(domain: String) {
+        context.dataStore.edit { it[Keys.FAKE_TLS_DOMAIN] = domain.trim() }
     }
 
     suspend fun saveCfH2Media(enabled: Boolean) {

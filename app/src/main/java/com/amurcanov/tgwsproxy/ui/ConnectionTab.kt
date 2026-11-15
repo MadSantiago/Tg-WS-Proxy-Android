@@ -37,6 +37,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.amurcanov.tgwsproxy.BuildConfig
+import com.amurcanov.tgwsproxy.FakeTls
 import com.amurcanov.tgwsproxy.ProxyController
 import com.amurcanov.tgwsproxy.ProxyService
 import com.amurcanov.tgwsproxy.SettingsStore
@@ -57,6 +58,8 @@ fun ConnectionTab(settingsStore: SettingsStore) {
     val savedCfEnabled by settingsStore.cfproxyEnabled.collectAsStateWithLifecycle(initialValue = true)
     val savedPoolSize by settingsStore.poolSize.collectAsStateWithLifecycle(initialValue = 4)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
+    val fakeTlsEnabled by settingsStore.fakeTlsEnabled.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_FAKE_TLS_ENABLED)
+    val fakeTlsDomain by settingsStore.fakeTlsDomain.collectAsStateWithLifecycle(initialValue = "")
 
     val scope = rememberCoroutineScope()
     val currentVersion = remember { "v${BuildConfig.VERSION_NAME.removePrefix("v")}" }
@@ -101,7 +104,9 @@ fun ConnectionTab(settingsStore: SettingsStore) {
         if (raw.isNotEmpty() && raw != "LOADING") raw else "00000000000000000000000000000000"
     }
     val bindIp = savedBindIp.trim().takeIf { it.isNotEmpty() } ?: "127.0.0.1"
-    val proxyUrl = "https://t.me/proxy?server=$bindIp&port=$port&secret=dd$secretForUrl"
+    // С Fake TLS прокси ждёт TLS ClientHello, и dd-ссылка не работает: нужен ee-секрет.
+    val linkSecret = FakeTls.linkSecret(secretForUrl, FakeTls.effectiveDomain(fakeTlsEnabled, fakeTlsDomain))
+    val proxyUrl = "https://t.me/proxy?server=$bindIp&port=$port&secret=$linkSecret"
     
     var applyMode by rememberSaveable { mutableStateOf("packages") }
 

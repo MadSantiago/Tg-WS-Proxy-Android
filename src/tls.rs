@@ -228,6 +228,23 @@ static TLS_INSECURE: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
 
 static TLS_INSECURE_H2: Lazy<Arc<ClientConfig>> = Lazy::new(|| with_h2_alpn(&TLS_INSECURE));
 
+/// Fake TLS: ClientHello для замера профиля маскирующего сайта. Только
+/// TLS 1.3, ALPN h2/http1.1, как на десктопе; рукопожатие не завершается,
+/// поэтому сертификат не проверяется.
+pub fn probe_client_config() -> Arc<ClientConfig> {
+    static CFG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
+        let mut c = ClientConfig::builder_with_provider(ring_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 supported by ring")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        c.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Arc::new(c)
+    });
+    CFG.clone()
+}
+
 /// Конфиг для H2-lane к CF: проверка как у WS без fronting, ALPN `h2`.
 pub fn h2_client_config() -> Arc<ClientConfig> {
     if !TLS_VERIFY.load(Ordering::Relaxed) {

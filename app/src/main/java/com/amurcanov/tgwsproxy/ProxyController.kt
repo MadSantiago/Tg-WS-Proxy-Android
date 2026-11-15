@@ -36,6 +36,10 @@ object ProxyController {
         // Экспериментальные функции не зависят от экспериментального режима DC.
         val cfH2Media = cfEnabled && settingsStore.cfH2Media.first()
         val tlsVerify = settingsStore.tlsVerify.first()
+        val fakeTlsDomain = FakeTls.effectiveDomain(
+            settingsStore.fakeTlsEnabled.first(),
+            settingsStore.fakeTlsDomain.first()
+        )
 
         val parsedIps = buildList {
             if (!isDcAuto) {
@@ -75,6 +79,7 @@ object ProxyController {
                 putExtra(ProxyService.EXTRA_DISABLE_SECURE, port80Fallback)
                 putExtra(ProxyService.EXTRA_CF_H2_MEDIA, cfH2Media)
                 putExtra(ProxyService.EXTRA_TLS_VERIFY, tlsVerify)
+                putExtra(ProxyService.EXTRA_FAKE_TLS_DOMAIN, fakeTlsDomain)
             }
         )
         ProxyTileService.requestSync(context)

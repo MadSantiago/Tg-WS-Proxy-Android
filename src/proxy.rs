@@ -1279,6 +1279,8 @@ impl ProxyPools {
         clear_cfproxy_429_cooldowns();
         set_ws_pool_fronting_first(true);
         if state != 0 && !self.cancel.is_cancelled() {
+            // Если профиль Fake TLS не сняли (не было сети), пробуем снова.
+            faketls::spawn_profile_probe(FAKE_TLS_DOMAIN.read().clone(), self.cancel.clone(), true);
             let dc_opt_map = DC_OPT.read().clone();
             self.warmup(&dc_opt_map).await;
         }
@@ -3054,6 +3056,9 @@ pub async fn run_proxy(
     if !FAKE_TLS_DOMAIN.read().is_empty() {
         linfo!("  Fake TLS:      {}", FAKE_TLS_DOMAIN.read().clone());
     }
+    // Десктоп 7fb01a7: профиль первой зашифрованной записи маскирующего сайта.
+    faketls::reset_profile();
+    faketls::spawn_profile_probe(FAKE_TLS_DOMAIN.read().clone(), cancel_root.clone(), false);
 
     let cancel_stats = cancel_root.clone();
     tokio::spawn(async move {

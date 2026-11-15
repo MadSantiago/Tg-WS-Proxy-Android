@@ -32,6 +32,10 @@
     <string name="cf_h2_media_hint">Медиа через одно HTTP/2-соединение с CloudFlare. Применяется при следующем запуске.</string>
     <string name="cf_h2_media_needs_cf">Нужен включённый CloudFlare CDN.</string>
     <string name="port80_fallback">Резервный порт 80</string>
+    <string name="fake_tls">FakeTLS</string>
+    <string name="fake_tls_hint">Трафик выглядит как HTTPS к выбранному сайту. Меняет ссылку прокси – после включения примените её заново.</string>
+    <string name="fake_tls_domain">Домен маскировки</string>
+    <string name="fake_tls_domain_invalid">Укажите имя хоста</string>
     <string name="cf_h2_media">Мультиплексирование медиа (HTTP/2)</string>
     <string name="experimental_mode">Экспериментальный режим</string>
     <string name="done">Готово</string>

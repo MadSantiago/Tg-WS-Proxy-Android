@@ -13,6 +13,8 @@ tokio-util = "0.7"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"
+# Уже в дереве через rustls; напрямую — для X25519-ключа Fake TLS ServerHello.
+ring = "0.17"
 # Корни Mozilla для проверки сертификатов WS (аналог certifi в десктопе).
 # Уже был в Cargo.lock как зависимость reqwest.
 webpki-roots = "1"
