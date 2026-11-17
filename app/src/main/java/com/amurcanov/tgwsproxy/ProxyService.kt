@@ -47,6 +47,7 @@ class ProxyService : Service() {
     private var lastCfH2Media: Boolean = SettingsStore.DEFAULT_CF_H2_MEDIA
     private var lastTlsVerify: Boolean = SettingsStore.DEFAULT_TLS_VERIFY
     private var lastFakeTlsDomain: String = ""
+    private var lastCfWorkerDomains: String = ""
 
     companion object {
         const val ACTION_START = "com.amurcanov.tgwsproxy.START"
@@ -64,6 +65,7 @@ class ProxyService : Service() {
         const val EXTRA_CF_H2_MEDIA = "EXTRA_CF_H2_MEDIA"
         const val EXTRA_TLS_VERIFY = "EXTRA_TLS_VERIFY"
         const val EXTRA_FAKE_TLS_DOMAIN = "EXTRA_FAKE_TLS_DOMAIN"
+        const val EXTRA_CF_WORKER_DOMAINS = "EXTRA_CF_WORKER_DOMAINS"
         
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
@@ -106,7 +108,8 @@ class ProxyService : Service() {
                 val cfH2Media = intent.getBooleanExtra(EXTRA_CF_H2_MEDIA, SettingsStore.DEFAULT_CF_H2_MEDIA)
                 val tlsVerify = intent.getBooleanExtra(EXTRA_TLS_VERIFY, SettingsStore.DEFAULT_TLS_VERIFY)
                 val fakeTlsDomain = intent.getStringExtra(EXTRA_FAKE_TLS_DOMAIN) ?: ""
-                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey, disableSecure, cfH2Media, tlsVerify, fakeTlsDomain)
+                val cfWorkerDomains = intent.getStringExtra(EXTRA_CF_WORKER_DOMAINS) ?: ""
+                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey, disableSecure, cfH2Media, tlsVerify, fakeTlsDomain, cfWorkerDomains)
             }
             ACTION_STOP -> {
                 stopProxy()
@@ -119,7 +122,7 @@ class ProxyService : Service() {
                 // If we had saved params, try to restart
                 if (lastPort > 0 && lastSecretKey.isNotEmpty()) {
                     Log.w(TAG, "Service restarted by system, re-starting proxy")
-                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey, lastDisableSecure, lastCfH2Media, lastTlsVerify, lastFakeTlsDomain)
+                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey, lastDisableSecure, lastCfH2Media, lastTlsVerify, lastFakeTlsDomain, lastCfWorkerDomains)
                 } else {
                     stopSelf()
                 }
@@ -150,7 +153,8 @@ class ProxyService : Service() {
                            disableSecure: Boolean = SettingsStore.DEFAULT_PORT80_FALLBACK,
                            cfH2Media: Boolean = SettingsStore.DEFAULT_CF_H2_MEDIA,
                            tlsVerify: Boolean = SettingsStore.DEFAULT_TLS_VERIFY,
-                           fakeTlsDomain: String = "") {
+                           fakeTlsDomain: String = "",
+                           cfWorkerDomains: String = "") {
         if (_isRunning.value || stopInProgress) return
         _isVerifiedRunning.value = false
 
@@ -167,6 +171,7 @@ class ProxyService : Service() {
         lastCfH2Media = cfH2Media
         lastTlsVerify = tlsVerify
         lastFakeTlsDomain = fakeTlsDomain
+        lastCfWorkerDomains = cfWorkerDomains
         notificationStartedAtMs = System.currentTimeMillis()
         lastNotificationContent = getString(R.string.notification_starting)
         lastNotificationAtMs = notificationStartedAtMs
@@ -208,6 +213,8 @@ class ProxyService : Service() {
                 NativeProxy.setTlsVerify(tlsVerify)
                 // Глобальное значение ядра: передаём и пустое, чтобы выключить.
                 NativeProxy.setFakeTlsDomain(fakeTlsDomain)
+                // Глобальное значение ядра: пустая строка отключает worker-пул.
+                NativeProxy.setCfWorkerDomains(cfWorkerDomains)
                 val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
                 if (result == 0) {
                     serviceScope.launch {
@@ -322,7 +329,8 @@ class ProxyService : Service() {
                 disableSecure = lastDisableSecure,
                 cfH2Media = lastCfH2Media,
                 tlsVerify = lastTlsVerify,
-                fakeTlsDomain = lastFakeTlsDomain
+                fakeTlsDomain = lastFakeTlsDomain,
+                cfWorkerDomains = lastCfWorkerDomains
             )
         }
     }

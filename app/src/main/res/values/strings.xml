@@ -36,6 +36,11 @@
     <string name="fake_tls_hint">Traffic looks like HTTPS to the chosen site. Changes the proxy link – apply it again after enabling.</string>
     <string name="fake_tls_domain">Masking domain</string>
     <string name="fake_tls_domain_invalid">Enter a host name</string>
+    <string name="cf_worker">Cloudflare Worker</string>
+    <string name="cf_worker_hint">Your own Cloudflare Worker domains, separated by commas or new lines. Tried before other bypass methods.</string>
+    <string name="cf_worker_domains">CF Worker domains</string>
+    <string name="cf_worker_domains_empty">Enter a domain</string>
+    <string name="cf_worker_domains_invalid">Some entry does not look like a domain.</string>
     <string name="cf_h2_media">Media multiplexing (HTTP/2)</string>
     <string name="experimental_mode">Experimental mode</string>
     <string name="done">Done</string>

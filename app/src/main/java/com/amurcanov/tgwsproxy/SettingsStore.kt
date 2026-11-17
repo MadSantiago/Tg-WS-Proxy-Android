@@ -31,6 +31,8 @@ class SettingsStore(private val context: Context) {
         const val DEFAULT_TLS_VERIFY = true
         // Fake TLS (ee-secret, SetFakeTlsDomain): выключен, домен не задан.
         const val DEFAULT_FAKE_TLS_ENABLED = false
+        // Свои Cloudflare Worker (SetCfWorkerDomains): выключено, список пуст.
+        const val DEFAULT_CF_WORKER_ENABLED = false
     }
 
     private object Keys {
@@ -55,6 +57,8 @@ class SettingsStore(private val context: Context) {
         val TLS_VERIFY = booleanPreferencesKey("tls_verify")
         val FAKE_TLS_ENABLED = booleanPreferencesKey("fake_tls_enabled")
         val FAKE_TLS_DOMAIN = stringPreferencesKey("fake_tls_domain")
+        val CF_WORKER_ENABLED = booleanPreferencesKey("cf_worker_enabled")
+        val CF_WORKER_DOMAINS = stringPreferencesKey("cf_worker_domains")
         val LOG_SHOW_DEBUG = booleanPreferencesKey("log_show_debug")
         val LOG_SHOW_INFO = booleanPreferencesKey("log_show_info")
         val LOG_SHOW_ERROR = booleanPreferencesKey("log_show_error")
@@ -106,6 +110,8 @@ class SettingsStore(private val context: Context) {
     val tlsVerify: Flow<Boolean> = context.dataStore.data.map { it[Keys.TLS_VERIFY] ?: DEFAULT_TLS_VERIFY }
     val fakeTlsEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.FAKE_TLS_ENABLED] ?: DEFAULT_FAKE_TLS_ENABLED }
     val fakeTlsDomain: Flow<String> = context.dataStore.data.map { it[Keys.FAKE_TLS_DOMAIN] ?: "" }
+    val cfWorkerEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.CF_WORKER_ENABLED] ?: DEFAULT_CF_WORKER_ENABLED }
+    val cfWorkerDomains: Flow<String> = context.dataStore.data.map { it[Keys.CF_WORKER_DOMAINS] ?: "" }
 
     val logShowDebug: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_DEBUG] ?: false }
     val logShowInfo: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_INFO] ?: DEFAULT_LOG_SHOW_INFO }
@@ -131,6 +137,14 @@ class SettingsStore(private val context: Context) {
 
     suspend fun saveTlsVerify(enabled: Boolean) {
         context.dataStore.edit { it[Keys.TLS_VERIFY] = enabled }
+    }
+
+    suspend fun saveCfWorkerEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.CF_WORKER_ENABLED] = enabled }
+    }
+
+    suspend fun saveCfWorkerDomains(domains: String) {
+        context.dataStore.edit { it[Keys.CF_WORKER_DOMAINS] = domains.trim() }
     }
 
     suspend fun saveFakeTlsEnabled(enabled: Boolean) {

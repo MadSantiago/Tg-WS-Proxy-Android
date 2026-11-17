@@ -36,6 +36,12 @@ object ProxyController {
         // Экспериментальные функции не зависят от экспериментального режима DC.
         val cfH2Media = cfEnabled && settingsStore.cfH2Media.first()
         val tlsVerify = settingsStore.tlsVerify.first()
+        // Выключенный Worker передаёт ядру пустой список: пул не создаётся.
+        val cfWorkerDomains = if (settingsStore.cfWorkerEnabled.first()) {
+            DomainList.forCore(settingsStore.cfWorkerDomains.first())
+        } else {
+            ""
+        }
         val fakeTlsDomain = FakeTls.effectiveDomain(
             settingsStore.fakeTlsEnabled.first(),
             settingsStore.fakeTlsDomain.first()
@@ -80,6 +86,7 @@ object ProxyController {
                 putExtra(ProxyService.EXTRA_CF_H2_MEDIA, cfH2Media)
                 putExtra(ProxyService.EXTRA_TLS_VERIFY, tlsVerify)
                 putExtra(ProxyService.EXTRA_FAKE_TLS_DOMAIN, fakeTlsDomain)
+                putExtra(ProxyService.EXTRA_CF_WORKER_DOMAINS, cfWorkerDomains)
             }
         )
         ProxyTileService.requestSync(context)

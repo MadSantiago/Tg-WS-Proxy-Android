@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.amurcanov.tgwsproxy.DomainList
 import com.amurcanov.tgwsproxy.FakeTls
 import com.amurcanov.tgwsproxy.ProxyService
 import com.amurcanov.tgwsproxy.SettingsStore
@@ -102,6 +103,8 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val port80Fallback by settingsStore.port80Fallback.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_PORT80_FALLBACK)
     val fakeTlsEnabled by settingsStore.fakeTlsEnabled.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_FAKE_TLS_ENABLED)
     val savedFakeTlsDomain by settingsStore.fakeTlsDomain.collectAsStateWithLifecycle(initialValue = "")
+    val cfWorkerEnabled by settingsStore.cfWorkerEnabled.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_CF_WORKER_ENABLED)
+    val savedCfWorkerDomains by settingsStore.cfWorkerDomains.collectAsStateWithLifecycle(initialValue = "")
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
     if (!isReady) {
@@ -138,6 +141,9 @@ fun SettingsTab(settingsStore: SettingsStore) {
     var customCfDomain by rememberSaveable(savedCustomDomain) { mutableStateOf(savedCustomDomain) }
     var fakeTlsDomainText by rememberSaveable(savedFakeTlsDomain) { mutableStateOf(savedFakeTlsDomain) }
     var fakeTlsSaveJob by remember { mutableStateOf<Job?>(null) }
+    var workerDomainsText by rememberSaveable(savedCfWorkerDomains) { mutableStateOf(savedCfWorkerDomains) }
+    var workerSaveJob by remember { mutableStateOf<Job?>(null) }
+    var workerFocused by remember { mutableStateOf(false) }
     // Поля ввода экспериментальных функций сами фокус не отпускают: по тапу
     // вне поля снимаем его вручную (см. pointerInput корневого Column).
     val focusManager = LocalFocusManager.current
@@ -195,8 +201,8 @@ fun SettingsTab(settingsStore: SettingsStore) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .pointerInput(fakeTlsFocused) {
-                detectTapGestures(onTap = { if (fakeTlsFocused) focusManager.clearFocus() })
+            .pointerInput(fakeTlsFocused, workerFocused) {
+                detectTapGestures(onTap = { if (fakeTlsFocused || workerFocused) focusManager.clearFocus() })
             }
             .verticalScroll(scrollState)
             .padding(start = 16.dp, end = 16.dp, top = 0.dp, bottom = 12.dp)
@@ -517,6 +523,54 @@ fun SettingsTab(settingsStore: SettingsStore) {
                     scope.launch { settingsStore.saveCfH2Media(enabled) }
                 }
             )
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+
+            // Cloudflare Worker (SetCfWorkerDomains): свои Worker-домены
+            // пробуются раньше остальных способов обхода. CF-proxy не требуется.
+            SettingSwitchRow(
+                title = stringResource(com.amurcanov.tgwsproxy.R.string.cf_worker),
+                subtitle = stringResource(com.amurcanov.tgwsproxy.R.string.cf_worker_hint),
+                checked = cfWorkerEnabled,
+                enabled = !isRunning,
+                onCheckedChange = { enabled ->
+                    scope.launch { settingsStore.saveCfWorkerEnabled(enabled) }
+                }
+            )
+            if (cfWorkerEnabled) {
+                val workersInvalid = DomainList.hasInvalid(workerDomainsText)
+                val workersEmpty = DomainList.parse(workerDomainsText).isEmpty() && !workersInvalid
+                val workersError = workersInvalid || workersEmpty
+                OutlinedTextField(
+                    value = workerDomainsText,
+                    onValueChange = { value ->
+                        workerDomainsText = value
+                        workerSaveJob?.cancel()
+                        workerSaveJob = scope.launch {
+                            delay(300)
+                            settingsStore.saveCfWorkerDomains(value)
+                        }
+                    },
+                    enabled = !isRunning,
+                    minLines = 1,
+                    maxLines = 3,
+                    isError = workersError,
+                    label = { Text(stringResource(com.amurcanov.tgwsproxy.R.string.cf_worker_domains)) },
+                    placeholder = { Text("worker.example.workers.dev") },
+                    supportingText = if (!workersError) null else {
+                        { Text(stringResource(if (workersInvalid) com.amurcanov.tgwsproxy.R.string.cf_worker_domains_invalid else com.amurcanov.tgwsproxy.R.string.cf_worker_domains_empty)) }
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onFocusChanged { workerFocused = it.isFocused },
+                    shape = RoundedCornerShape(24.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+                    )
+                )
+            }
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
 

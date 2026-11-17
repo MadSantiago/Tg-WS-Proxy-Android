@@ -36,6 +36,11 @@
     <string name="fake_tls_hint">Трафик выглядит как HTTPS к выбранному сайту. Меняет ссылку прокси – после включения примените её заново.</string>
     <string name="fake_tls_domain">Домен маскировки</string>
     <string name="fake_tls_domain_invalid">Укажите имя хоста</string>
+    <string name="cf_worker">Cloudflare Worker</string>
+    <string name="cf_worker_hint">Свои Cloudflare Worker-домены, через запятую или с новой строки. Пробуются раньше остальных способов обхода.</string>
+    <string name="cf_worker_domains">CF Worker-домены</string>
+    <string name="cf_worker_domains_empty">Введите домен</string>
+    <string name="cf_worker_domains_invalid">Есть запись, не похожая на домен.</string>
     <string name="cf_h2_media">Мультиплексирование медиа (HTTP/2)</string>
     <string name="experimental_mode">Экспериментальный режим</string>
     <string name="done">Готово</string>
