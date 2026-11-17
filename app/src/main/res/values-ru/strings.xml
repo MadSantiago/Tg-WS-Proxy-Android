@@ -58,7 +58,7 @@
     <string name="update_check_manually">Проверить GitHub вручную</string>
     <string name="actions">Действия</string>
     <string name="items_count">%1$d пункта</string>
-    <string name="links_count">%1$d ссылки</string>
+    <string name="links_count">Ссылок: %1$d</string>
     <string name="raise_issue">Поднять вопрос</string>
     <string name="open_github_issue">Открыть GitHub issue</string>
     <string name="build_report">Собрать отчёт</string>
@@ -72,8 +72,10 @@
     <string name="update_check_failed">Не удалось проверить обновления</string>
     <string name="update_already_latest">У вас уже последняя версия: %1$s</string>
     <string name="about_project">О проекте</string>
-    <string name="android_author">Автор Android-версии</string>
-    <string name="android_author_subtitle">GitHub профиль amurcanov</string>
+    <string name="android_author">Автор модификации</string>
+    <string name="android_author_subtitle">GitHub профиль MadSantiago</string>
+    <string name="modification_repo">Репозиторий модификации</string>
+    <string name="modification_repo_subtitle">Исходники и релизы этой модификации</string>
     <string name="android_fork_repo">Репозиторий Android-форка</string>
     <string name="android_fork_repo_subtitle">Исходники и релизы этого приложения</string>
     <string name="original_tg_ws_proxy">Оригинальный tg-ws-proxy</string>

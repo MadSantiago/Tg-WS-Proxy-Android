@@ -72,8 +72,10 @@
     <string name="update_check_failed">Could not check for updates</string>
     <string name="update_already_latest">You already have the latest version: %1$s</string>
     <string name="about_project">About the project</string>
-    <string name="android_author">Android version author</string>
-    <string name="android_author_subtitle">GitHub profile amurcanov</string>
+    <string name="android_author">Modification author</string>
+    <string name="android_author_subtitle">GitHub profile MadSantiago</string>
+    <string name="modification_repo">Modification repository</string>
+    <string name="modification_repo_subtitle">Source and releases of this modification</string>
     <string name="android_fork_repo">Android fork repository</string>
     <string name="android_fork_repo_subtitle">Source code and releases for this app</string>
     <string name="original_tg_ws_proxy">Original tg-ws-proxy</string>

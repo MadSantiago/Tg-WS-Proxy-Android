@@ -100,8 +100,9 @@ import kotlin.math.sin
 import kotlinx.coroutines.launch
 
 private const val AndroidForkRepoUrl = "https://github.com/amurcanov/tg-ws-proxy-android"
-private const val AndroidForkIssuesUrl = "https://github.com/amurcanov/tg-ws-proxy-android/issues"
-private const val DeveloperProfileUrl = "https://github.com/amurcanov"
+private const val AndroidForkIssuesUrl = "https://github.com/MadSantiago/Tg-WS-Proxy-Android/issues"
+private const val DeveloperProfileUrl = "https://github.com/MadSantiago"
+private const val ModificationRepoUrl = "https://github.com/MadSantiago/Tg-WS-Proxy-Android"
 private const val OriginalProjectUrl = "https://github.com/Flowseal/tg-ws-proxy"
 private const val ProxyReferenceUrl = "https://github.com/Flowseal/tg-ws-proxy/issues/389"
 private const val AndroidAppDonateUrl = ""
@@ -324,7 +325,7 @@ fun InfoTab(settingsStore: SettingsStore) {
 
         ExpandableSectionCard(
             title = stringResource(R.string.about_project),
-            itemCount = stringResource(R.string.links_count, 4),
+            itemCount = stringResource(R.string.links_count, 5),
             expanded = projectExpanded,
             onToggle = { projectExpanded = !projectExpanded },
             icon = {
@@ -343,6 +344,20 @@ fun InfoTab(settingsStore: SettingsStore) {
                 icon = {
                     Icon(
                         imageVector = Icons.Default.Person,
+                        contentDescription = null,
+                        tint = onContainerAccent(),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            )
+
+            ProjectLinkRow(
+                title = stringResource(R.string.modification_repo),
+                subtitle = stringResource(R.string.modification_repo_subtitle),
+                onClick = { openUrlInBrowser(context, ModificationRepoUrl) },
+                icon = {
+                    Icon(
+                        painter = painterResource(id = R.drawable.ic_github),
                         contentDescription = null,
                         tint = onContainerAccent(),
                         modifier = Modifier.size(18.dp)
@@ -605,6 +620,15 @@ private fun InfoHeroCard(onSupportClick: () -> Unit) {
                         containerColor = colors.primary.copy(alpha = if (isDark) 0.18f else 0.10f),
                         borderColor = colors.primary.copy(alpha = if (isDark) 0.22f else 0.14f),
                         modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    HeroMetaPill(
+                        text = "MadSantiago Modification",
+                        containerColor = glassColor,
+                        borderColor = glassBorder,
+                        modifier = Modifier.fillMaxWidth(0.72f)
                     )
                 }
 
