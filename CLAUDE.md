@@ -58,7 +58,11 @@ gradlew.bat :app:assembleArm64Debug
 
 - `src/` — Rust-ядро: `proxy.rs` (маршрутизация, пулы, fallback), `ws.rs`, `cfproxy.rs`,
   `cf_h2.rs` (HTTP/2-мультиплексирование медиа через CF), `tls.rs` (проверка сертификатов),
-  `config.rs` (глобальные настройки и статистика), `lib.rs` (FFI).
+  `config.rs` (глобальные настройки и статистика), `lib.rs` (FFI),
+  `cf_websocket.rs` (CF proxy: чередование TLS/plain после таймаута, cooldown пар
+  «домен + режим», счётчик успехов режима; порт десктопа 1.12.0),
+  `client_watch.rs` (отмена исходящих подключений fallback, если клиент ушёл:
+  task-local с дубликатом сокета клиента, `with_client_setup`).
 - `app/src/main/java/com/amurcanov/tgwsproxy/`:
   - `SettingsStore.kt` — DataStore с настройками и значениями по умолчанию;
   - `ProxyController.kt` — собирает настройки и запускает `ProxyService`;

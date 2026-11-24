@@ -294,7 +294,10 @@ impl RawWebSocket {
         let frame = build_frame(OP_CLOSE, &[], true);
         let _ = self.write_frame(&frame, WS_CONTROL_TIMEOUT).await;
         let mut writer = self.writer.lock().await;
-        let _ = shutdown_match(&mut writer).await;
+        // Десктоп v1.12.0 (CLOSE_TIMEOUT): shutdown (close_notify у TLS) не
+        // должен висеть на мёртвом соединении; по таймауту сокет просто
+        // закрывается при drop.
+        let _ = tokio::time::timeout(WS_CONTROL_TIMEOUT, shutdown_match(&mut writer)).await;
     }
 
     // recv с дедлайном чтения (для bridge).
@@ -762,6 +765,29 @@ pub async fn ws_connect_once(
 }
 
 pub async fn ws_connect_once_full(
+    dial_addr: &str,
+    domain: &str,
+    path: &str,
+    timeout: Duration,
+    sni: Option<&str>,
+    secure: bool,
+) -> Result<RawWebSocket, WsError> {
+    // Десктоп v1.12.0 (raw_websocket.py): `timeout` — общий дедлайн попытки
+    // (TCP, TLS, отправка и ответ на Upgrade), а не лимит каждой стадии:
+    // иначе «3 с» из CF_CONNECT_TIMEOUTS растягивались бы до 4×3 с.
+    // Отмена будущего закрывает сокет (drop).
+    match tokio::time::timeout(
+        timeout,
+        ws_connect_once_inner(dial_addr, domain, path, timeout, sni, secure),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(WsError::Timeout),
+    }
+}
+
+async fn ws_connect_once_inner(
     dial_addr: &str,
     domain: &str,
     path: &str,

@@ -1,3 +1,5 @@
+pub mod cf_websocket;
+pub mod client_watch;
 pub mod cfproxy;
 pub mod config;
 pub mod crypto;
@@ -87,6 +89,7 @@ pub unsafe extern "C" fn StartProxy(
         linfo!("CF H2 media multiplexing: on (experimental)");
     }
     cfproxy::clear_cfproxy_429_cooldowns();
+    cf_websocket::reset_cf_timeouts();
     proxy::reset_tcp_backoff();
     proxy::reset_port_memory();
 
@@ -183,6 +186,7 @@ pub extern "C" fn StopProxy() -> c_int {
     DC_FAIL_UNTIL.write().clear();
     IP_FAIL_UNTIL.write().clear();
     cfproxy::clear_cfproxy_429_cooldowns();
+    cf_websocket::reset_cf_timeouts();
     proxy::reset_tcp_backoff();
     proxy::reset_port_memory();
     proxy::set_ws_pool_fronting_first(true);

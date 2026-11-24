@@ -651,7 +651,12 @@ type CfConnectHook = Arc<
 pub struct CfWorkerPool {
     // Синхронный мьютекс: под ним нет await.
     state: parking_lot::Mutex<CfWorkerState>,
-    exhausted_until: Mutex<HashMap<String, f64>>,
+    // Монотонные секунды (now_monotonic). Синхронный мьютекс: под ним нет
+    // await, а schedule_refill вызывается из синхронного кода.
+    exhausted_until: parking_lot::Mutex<HashMap<String, f64>>,
+    // Режим последнего успешного подключения: TLS или plain (десктоп
+    // try_secure_first, 4a338a0).
+    try_secure_first: std::sync::atomic::AtomicBool,
     timings: CfWorkerPoolTimings,
     // Дочерний токен корневого: отменяется и StopProxy, и close().
     cancel: CancellationToken,
@@ -720,7 +725,8 @@ impl CfWorkerPool {
                 epoch: 0,
                 slots: HashMap::new(),
             }),
-            exhausted_until: Mutex::new(HashMap::new()),
+            exhausted_until: parking_lot::Mutex::new(HashMap::new()),
+            try_secure_first: std::sync::atomic::AtomicBool::new(true),
             timings,
             cancel: cancel_token.child_token(),
             tasks: parking_lot::Mutex::new(Vec::new()),
@@ -802,6 +808,22 @@ impl CfWorkerPool {
         hit.map(|e| (e.ws, e.worker_domain))
     }
 
+    /// Если все домены воркера на паузе (429/5xx/сеть), пополнение не имеет
+    /// смысла до ближайшего окончания паузы: переносим на этот момент, а не
+    /// наращиваем экспоненциальный бэкофф (десктоп 324f69f).
+    fn defer_if_all_workers_paused(&self, slot: &mut CfWorkerSlot, worker_domains: &[String], now: f64) -> bool {
+        let exhausted = self.exhausted_until.lock();
+        let first_available = worker_domains
+            .iter()
+            .map(|d| exhausted.get(d).copied().unwrap_or(now))
+            .fold(f64::INFINITY, f64::min);
+        if !first_available.is_finite() || first_available <= now {
+            return false;
+        }
+        slot.refill_after = first_available;
+        true
+    }
+
     fn schedule_refill(self: &Arc<Self>, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
         if self.cancel.is_cancelled() || Self::target_size() == 0 || worker_domains.is_empty() {
             return;
@@ -815,7 +837,10 @@ impl CfWorkerPool {
                 .slots
                 .entry(dc)
                 .or_insert_with(|| CfWorkerSlot::new(now));
-            if slot.refilling || now < slot.refill_after {
+            if slot.refilling
+                || self.defer_if_all_workers_paused(slot, &worker_domains, now)
+                || now < slot.refill_after
+            {
                 return;
             }
             slot.refilling = true;
@@ -853,7 +878,7 @@ impl CfWorkerPool {
         for _ in 0..needed {
             let result = tokio::select! {
                 _ = self.cancel.cancelled() => return,
-                r = self.connect_one(worker_domains.clone(), fallback_dst.clone(), dc) => r,
+                r = self.connect_one(worker_domains.clone(), fallback_dst.clone(), dc, CF_WORKER_POOL_CONNECT_TIMEOUT) => r,
             };
             let Some((ws, worker_domain)) = result else {
                 break;
@@ -895,6 +920,10 @@ impl CfWorkerPool {
                 slot.failures = 0;
                 slot.refill_after = 0.0;
                 None
+            } else if self.defer_if_all_workers_paused(slot, &worker_domains, now) {
+                // Все воркеры на паузе: пауза уже учтена в refill_after,
+                // неудача не считается (десктоп 324f69f).
+                return;
             } else {
                 slot.failures = slot.failures.saturating_add(1);
                 let delay = backoff_delay(
@@ -1031,11 +1060,15 @@ impl CfWorkerPool {
         }
     }
 
-    async fn connect_one(
+    /// Подключение к воркеру: домены по очереди, у каждого сначала режим
+    /// последнего успеха (TLS/plain), после таймаута — другой (4a338a0).
+    /// `timeout` — потолок на попытку в одном режиме, включая DoH-повтор.
+    pub async fn connect_one(
         &self,
         worker_domains: Vec<String>,
         fallback_dst: String,
         dc: i32,
+        timeout: f64,
     ) -> Option<(RawWebSocket, String)> {
         #[cfg(test)]
         {
@@ -1045,23 +1078,37 @@ impl CfWorkerPool {
                 return hook(dc).await;
             }
         }
-        let secure = cf_use_tls();
-        let query = format!("dst={}&dc={}", fallback_dst, dc);
-        let path = format!("/apiws?{}", query);
+        let path = format!("/apiws?dst={}&dc={}", fallback_dst, dc);
+        let first = self.try_secure_first.load(Ordering::Relaxed);
+        let modes: Vec<bool> = if cf_use_tls() { vec![first, !first] } else { vec![false] };
         for worker_domain in self.available_domains(worker_domains).await {
-            match ws_connect_full_opts(&worker_domain, &worker_domain, &path, 8.0, None, secure)
+            for (i, &secure) in modes.iter().enumerate() {
+                let attempt = tokio::time::timeout(
+                    Duration::from_secs_f64(timeout),
+                    ws_connect_full_opts(&worker_domain, &worker_domain, &path, timeout, None, secure),
+                )
                 .await
-            {
-                Ok(ws) => return Some((ws, worker_domain)),
-                Err(exc) => {
-                    ldebug!(
-                        "CF worker pool connect DC{} via {} for {} failed: {}",
-                        dc,
-                        worker_domain,
-                        fallback_dst,
-                        exc.compact()
-                    );
-                    self.report_failure(&worker_domain, &exc).await;
+                .unwrap_or(Err(WsError::Timeout));
+                match attempt {
+                    Ok(ws) => {
+                        self.try_secure_first.store(secure, Ordering::Relaxed);
+                        return Some((ws, worker_domain));
+                    }
+                    Err(exc) => {
+                        ldebug!(
+                            "CF worker connect DC{} via {} for {} failed (tls={}): {}",
+                            dc,
+                            worker_domain,
+                            fallback_dst,
+                            secure,
+                            exc.compact()
+                        );
+                        if i + 1 < modes.len() && crate::cf_websocket::is_timeout(&exc) {
+                            continue;
+                        }
+                        self.report_failure(&worker_domain, &exc).await;
+                        break;
+                    }
                 }
             }
         }
@@ -1069,8 +1116,8 @@ impl CfWorkerPool {
     }
 
     pub async fn available_domains(&self, worker_domains: Vec<String>) -> Vec<String> {
-        let now = now_unix_f64();
-        let mut exhausted = self.exhausted_until.lock().await;
+        let now = now_monotonic();
+        let mut exhausted = self.exhausted_until.lock();
         let mut domains = Vec::new();
         let mut seen = HashSet::new();
         for domain in worker_domains {
@@ -1095,8 +1142,36 @@ impl CfWorkerPool {
         domains
     }
 
-    pub async fn report_failure(&self, _worker_domain: &str, _exc: &WsError) {
-        // TODO: picks up 429/daily-limit handling — как в оригинале пока no-op.
+    /// Пауза для домена воркера после ошибки (десктоп 0970820): 429 —
+    /// дневной лимит бесплатного плана, пауза до полуночи UTC; 5xx и
+    /// сетевые ошибки/таймауты — `CF_WORKER_FAILURE_COOLDOWN`. Остальные
+    /// ответы (челлендж, неверный маршрут) домен не отключают.
+    pub async fn report_failure(&self, worker_domain: &str, exc: &WsError) {
+        let now = now_monotonic();
+        let (until, reason) = match exc {
+            WsError::Handshake(h) if h.status_code == 429 => (
+                now + (86400.0 - (now_unix_f64() % 86400.0)),
+                "daily request limit".to_string(),
+            ),
+            WsError::Handshake(h) if h.status_code >= 500 => {
+                (now + CF_WORKER_FAILURE_COOLDOWN, format!("HTTP {}", h.status_code))
+            }
+            WsError::Handshake(_) => return,
+            WsError::Io(_) | WsError::Timeout => (now + CF_WORKER_FAILURE_COOLDOWN, exc.compact()),
+            _ => return,
+        };
+        let mut exhausted = self.exhausted_until.lock();
+        if exhausted.get(worker_domain).copied().unwrap_or(0.0) > now {
+            return;
+        }
+        exhausted.insert(worker_domain.to_string(), until);
+        drop(exhausted);
+        lwarn!(
+            "CF worker {} disabled for {} seconds: {}",
+            worker_domain,
+            ((until - now) as i64).max(1),
+            reason
+        );
     }
 
     pub async fn warmup(self: &Arc<Self>, dc_opt_map: &HashMap<i32, String>) {
@@ -1144,7 +1219,8 @@ impl CfWorkerPool {
     /// после этого ничего не меняют (epoch).
     pub async fn reset(&self) {
         close_detached(self.take_all(true));
-        self.exhausted_until.lock().await.clear();
+        self.exhausted_until.lock().clear();
+        self.try_secure_first.store(true, Ordering::Relaxed);
     }
 
     /// Остановка: отмена фоновых задач, ожидание их завершения, закрытие
@@ -1169,7 +1245,7 @@ impl CfWorkerPool {
             }
         })
         .await;
-        self.exhausted_until.lock().await.clear();
+        self.exhausted_until.lock().clear();
     }
 }
 
@@ -1277,6 +1353,7 @@ impl ProxyPools {
         reset_tcp_backoff();
         reset_port_memory();
         clear_cfproxy_429_cooldowns();
+        crate::cf_websocket::reset_cf_timeouts();
         set_ws_pool_fronting_first(true);
         if state != 0 && !self.cancel.is_cancelled() {
             // Если профиль Fake TLS не сняли (не было сети), пробуем снова.
@@ -1989,7 +2066,12 @@ where
 {
     let mut remote = None;
     for (i, &port) in ports.iter().enumerate() {
-        match tcp_fallback_attempt(dst, port, init, &label).await {
+        let Some(attempt) =
+            crate::client_watch::with_client_setup(tcp_fallback_attempt(dst, port, init, &label)).await
+        else {
+            return client_left_during_setup(&label, 0, &cancel_token);
+        };
+        match attempt {
             TcpAttempt::Connected(r) => {
                 if i > 0 || port != PORT_TLS {
                     linfo!("[{}] TCP fallback connected to {}:{}", label, dst, port);
@@ -2054,7 +2136,14 @@ async fn try_cfproxy_base_domain(
     let domain = format!("kws{}.{}", dc, base_domain);
     ldebug!(" CF try {}", domain);
 
-    let (ws, resolved_ip, err) = cf_connect_domain(&domain, ws_path, 5.0).await;
+    let (ws, resolved_ip, err) = match cf_connect_domain(&base_domain, &domain, ws_path, 5.0).await {
+        crate::cfproxy::CfConnect::Connected(ws, ip) => (Some(ws), ip, None),
+        crate::cfproxy::CfConnect::Failed(ip, e) => (None, ip, Some(e)),
+        crate::cfproxy::CfConnect::Skipped => {
+            ldebug!(" CF skip {}: timeout cooldown (tls/plain)", base_domain);
+            return (None, String::new());
+        }
+    };
     if let Some(e) = err {
         // Cooldown ставим ТОЛЬКО при HTTP 429, иначе любой reset/timeout
         // выжигал бы домены и плодил лавину cooldown.
@@ -2172,6 +2261,14 @@ async fn cfproxy_acquire_ws(
 // добываются БЕЗ halves, затем halves уходят в bridge/tcp.
 // ---------------------------------------------------------------------------
 
+/// Клиент ушёл, пока fallback устанавливал соединение: отменяем фоновые
+/// попытки (параллельные CF-домены) и считаем обработку законченной.
+fn client_left_during_setup(label: &str, dc: i32, cancel_token: &CancellationToken) -> bool {
+    cancel_token.cancel();
+    ldebug!("[{}] DC{} client left during fallback setup", label, dc);
+    true
+}
+
 pub async fn do_fallback<R, W>(
     pools: &ProxyPools,
     conn_read: R,
@@ -2212,39 +2309,28 @@ where
             );
             Some(ws)
         } else {
-            let secure = cf_use_tls();
-            let query = format!("dst={}&dc={}", fallback_dst, dc);
-            let path = format!("/apiws?{}", query);
-            let mut found = None;
-            for worker_domain in pools.cf_worker.available_domains(worker_domains.clone()).await {
-                linfo!(
-                    "[{}] DC{}{} -> trying CF worker {} for {}",
-                    label, dc, m_tag, worker_domain, fallback_dst
-                );
-                match ws_connect_full_opts(
-                    &worker_domain,
-                    &worker_domain,
-                    &path,
-                    10.0,
-                    None,
-                    secure,
-                )
-                .await
-                {
-                    Ok(ws) => {
-                        found = Some(ws);
-                        break;
-                    }
-                    Err(exc) => {
-                        pools.cf_worker.report_failure(&worker_domain, &exc).await;
-                        lwarn!(
-                            "[{}] DC{}{} CF worker {} failed: {}",
-                            label, dc, m_tag, worker_domain, exc.compact()
-                        );
-                    }
+            // Режимы TLS/plain, паузы упавших доменов и их учёт — в connect_one
+            // (десктоп _cfproxy_worker_fallback -> cf_worker_pool.connect_one).
+            let dialed = crate::client_watch::with_client_setup(pools.cf_worker.connect_one(
+                worker_domains.clone(),
+                fallback_dst.clone(),
+                dc,
+                10.0,
+            ))
+            .await;
+            let Some(dialed) = dialed else {
+                return client_left_during_setup(&label, dc, &cancel_token);
+            };
+            match dialed {
+                Some((ws, worker_domain)) => {
+                    linfo!(
+                        "[{}] DC{}{} -> CF worker {} for {}",
+                        label, dc, m_tag, worker_domain, fallback_dst
+                    );
+                    Some(ws)
                 }
+                None => None,
             }
-            found
         };
         if let Some(ws) = worker_ws {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
@@ -2276,7 +2362,9 @@ where
         // Десктоп bridge.py do_fallback, ветка 'cf': медиа — сначала
         // через готовый H2-lane. Без готового lane try_open сразу отдаёт
         // None и готовит lane в фоне: клиент не ждёт preflight.
-        if is_media && h2_media_enabled() {
+        // v1.12.0 (219f38c): H2 идёт только по TLS, поэтому после таймаутов TLS
+        // (plain удаётся чаще) медиа остаётся на WS.
+        if is_media && h2_media_enabled() && crate::cf_websocket::cf_prefers_tls() {
             match pools.h2.try_open(dc, &label) {
                 Ok(Some(channel)) => {
                     STATS.connections_h2.fetch_add(1, Ordering::Relaxed);
@@ -2297,9 +2385,17 @@ where
                 Err(e) => ldebug!("[{}] H2 unavailable: {}", label, e),
             }
         }
-        if let Some((ws, _chosen_domain)) =
-            cfproxy_acquire_ws(dc, is_media, ws_path, &cancel_token).await
-        {
+        let acquired = crate::client_watch::with_client_setup(cfproxy_acquire_ws(
+            dc,
+            is_media,
+            ws_path,
+            &cancel_token,
+        ))
+        .await;
+        let Some(acquired) = acquired else {
+            return client_left_during_setup(&label, dc, &cancel_token);
+        };
+        if let Some((ws, _chosen_domain)) = acquired {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
             linfo!(" DC{}{} подключен через CF", dc, m_tag);
 
@@ -2385,7 +2481,14 @@ async fn read_proxy_protocol_line(conn: &mut TcpStream) -> Option<String> {
     }
 }
 
-pub async fn handle_client(
+pub async fn handle_client(pools: Arc<ProxyPools>, conn: TcpStream, cancel_token: CancellationToken) {
+    // Десктоп v1.12.0 (client_setup): исходящие подключения fallback
+    // отменяются, если клиент ушёл, пока они устанавливались.
+    let watch = crate::client_watch::ClientWatch::new(&conn);
+    crate::client_watch::run_with_watch(watch, handle_client_inner(pools, conn, cancel_token)).await;
+}
+
+async fn handle_client_inner(
     pools: Arc<ProxyPools>,
     mut conn: TcpStream,
     cancel_token: CancellationToken,
@@ -3534,6 +3637,162 @@ mod cf_worker_pool_tests {
             assert_eq!(s.refill_after, 0.0);
         });
         pool.close().await;
+    }
+
+    fn handshake_err(code: i32) -> WsError {
+        WsError::Handshake(crate::ws::WsHandshakeError {
+            status_code: code,
+            status_line: format!("{} test", code),
+            headers: HashMap::new(),
+            location: String::new(),
+        })
+    }
+
+    fn paused_until(pool: &CfWorkerPool, domain: &str) -> Option<f64> {
+        pool.exhausted_until.lock().get(domain).copied()
+    }
+
+    // Десктоп test_all_paused_workers_defer_refill_until_first_expiry.
+    #[tokio::test]
+    async fn all_paused_workers_defer_refill_until_first_expiry() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let (pool, script) = pool(timings());
+        let now = now_monotonic();
+        let domains = vec!["later.example".to_string(), "first.example".to_string()];
+        {
+            let mut e = pool.exhausted_until.lock();
+            e.insert("later.example".into(), now + 200.0);
+            e.insert("first.example".into(), now + 150.0);
+            e.insert("unrelated.example".into(), now + 5.0);
+        }
+        with_slot(&pool, 2, |s| {
+            s.rotating = true;
+            s.refill_after = now + 180.0;
+            s.failures = 3;
+        });
+        pool.schedule_refill(2, DST.into(), domains.clone());
+        with_slot(&pool, 2, |s| {
+            // Пауза первого домена короче бэкоффа и побеждает; неудача не считается.
+            assert_eq!(s.refill_after, now + 150.0);
+            assert_eq!(s.failures, 3);
+            assert!(!s.refilling);
+        });
+        assert_eq!(calls(&pool), 0);
+
+        // Пауза первого домена закончилась: пополнение идёт и чистит бэкофф.
+        pool.exhausted_until
+            .lock()
+            .insert("first.example".into(), now - 1.0);
+        with_slot(&pool, 2, |s| s.refill_after = 0.0);
+        let (ready, _peer) = test_ws_pair().await;
+        script.lock().push_back(Some((ready, "first.example".to_string())));
+        pool.schedule_refill(2, DST.into(), domains);
+        join_tasks(&pool).await;
+        assert_eq!(calls(&pool), 1);
+        assert_eq!(bucket_domains(&pool, 2), ["first.example"]);
+        with_slot(&pool, 2, |s| {
+            assert_eq!(s.failures, 0);
+            assert_eq!(s.refill_after, 0.0);
+        });
+        pool.close().await;
+    }
+
+    // Десктоп test_failed_dial_pauses_last_available_worker: connect упал и
+    // сам поставил последний домен на паузу — следующая попытка не раньше её
+    // конца, а счётчик неудач не растёт.
+    #[tokio::test]
+    async fn failed_refill_that_paused_every_worker_does_not_grow_backoff() {
+        let _lock = POOL_TEST_LOCK.lock().await;
+        let _g = Globals::set(4);
+        let (pool, _script) = pool(timings());
+        let now = now_monotonic();
+        let until = now + CF_WORKER_FAILURE_COOLDOWN;
+        // Все домены на паузе к моменту, когда refill считает неудачу.
+        pool.exhausted_until
+            .lock()
+            .insert("worker.example".into(), until);
+        let epoch = with_slot(&pool, 2, |s| {
+            s.rotating = true;
+            s.refilling = true;
+            0u64
+        });
+        *pool.connect_hook.lock() = Some(Arc::new(|_dc| Box::pin(async { None })));
+        pool.clone()
+            .refill(2, DST.into(), domains(), epoch)
+            .await;
+        with_slot(&pool, 2, |s| {
+            assert_eq!(s.refill_after, until);
+            assert_eq!(s.failures, 0);
+        });
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn failure_429_disables_domain_until_utc_midnight() {
+        let pool = CfWorkerPool::new(CancellationToken::new());
+        let now = now_monotonic();
+        let to_midnight = 86400.0 - (now_unix_f64() % 86400.0);
+        pool.report_failure("w.example", &handshake_err(429)).await;
+        let until = paused_until(&pool, "w.example").expect("429 must pause the domain");
+        assert!(
+            (until - (now + to_midnight)).abs() < 2.0,
+            "until={} expected≈{}",
+            until,
+            now + to_midnight
+        );
+        assert!(pool.available_domains(vec!["w.example".into()]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failure_5xx_and_network_errors_pause_for_a_minute() {
+        for exc in [
+            handshake_err(503),
+            WsError::Timeout,
+            WsError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ] {
+            let pool = CfWorkerPool::new(CancellationToken::new());
+            let now = now_monotonic();
+            pool.report_failure("w.example", &exc).await;
+            let until = paused_until(&pool, "w.example").expect("must pause");
+            assert!(
+                (until - (now + CF_WORKER_FAILURE_COOLDOWN)).abs() < 1.0,
+                "{}",
+                exc.compact()
+            );
+            assert!(pool.available_domains(vec!["w.example".into()]).await.is_empty());
+            // Пауза истекла — домен снова доступен и запись убрана.
+            pool.exhausted_until.lock().insert("w.example".into(), now - 1.0);
+            assert_eq!(
+                pool.available_domains(vec!["w.example".into()]).await,
+                ["w.example"]
+            );
+            assert!(paused_until(&pool, "w.example").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_client_errors_and_unknown_errors_keep_domain_available() {
+        let pool = CfWorkerPool::new(CancellationToken::new());
+        for code in [400, 403, 404] {
+            pool.report_failure("w.example", &handshake_err(code)).await;
+        }
+        pool.report_failure("w.example", &WsError::Other("unexpected".into())).await;
+        pool.report_failure("w.example", &WsError::Canceled).await;
+        assert!(paused_until(&pool, "w.example").is_none());
+        assert_eq!(
+            pool.available_domains(vec!["w.example".into()]).await,
+            ["w.example"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_does_not_shorten_a_longer_pause() {
+        let pool = CfWorkerPool::new(CancellationToken::new());
+        pool.report_failure("w.example", &handshake_err(429)).await;
+        let until = paused_until(&pool, "w.example").unwrap();
+        pool.report_failure("w.example", &handshake_err(503)).await;
+        assert_eq!(paused_until(&pool, "w.example"), Some(until));
     }
 
     #[tokio::test]

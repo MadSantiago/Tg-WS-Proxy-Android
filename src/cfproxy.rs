@@ -575,11 +575,35 @@ fn new_timed_attempt_timeout(base: Duration, phase: Duration) -> Duration {
     eff
 }
 
-pub async fn cf_connect_domain(
+/// Итог `cf_connect_domain`.
+pub enum CfConnect {
+    /// (ws, IP из DoH или пусто, если хватило имени)
+    Connected(RawWebSocket, String),
+    /// (IP из DoH или пусто, последняя ошибка)
+    Failed(String, WsError),
+    /// Режимы домена в cooldown после таймаутов (v1.12.0): попыток не было.
+    Skipped,
+}
+
+/// Одна стадия подключения (по имени или по IP из DoH) с чередованием
+/// TLS ↔ plain после таймаута (десктоп v1.12.0, cf_websocket.py).
+async fn cf_dial_stage(
+    name: &str,
+    dial_addr: &str,
     domain: &str,
     path: &str,
-    timeout: f64,
-) -> (Option<RawWebSocket>, String, Option<WsError>) {
+    phase_timeout: Duration,
+) -> crate::cf_websocket::CfDial<RawWebSocket> {
+    crate::cf_websocket::connect_cf_modes(name, domain, cf_use_tls(), phase_timeout, |tls, t| {
+        let t = new_timed_attempt_timeout(t, phase_timeout);
+        async move { ws_connect_once(dial_addr, domain, path, t, tls).await }
+    })
+    .await
+}
+
+/// `name` — базовый домен (без kws{dc}): по нему считается cooldown режимов.
+pub async fn cf_connect_domain(name: &str, domain: &str, path: &str, timeout: f64) -> CfConnect {
+    use crate::cf_websocket::CfDial;
     let path = if path.is_empty() { "/apiws" } else { path };
 
     let attempt_timeout = crate::ws::ws_connect_timeout(timeout);
@@ -588,25 +612,25 @@ pub async fn cf_connect_domain(
         phase_timeout = CFPROXY_DIAL_PHASE_TIMEOUT;
     }
 
-    let host_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
-    match ws_connect_once(domain, domain, path, host_timeout, cf_use_tls()).await {
-        Ok(ws) => return (Some(ws), String::new(), None),
-        Err(host_err) => {
-            if is_http_status_error(&host_err, 429) {
-                return (None, String::new(), Some(host_err));
-            }
-            let resolved_ip = resolve_doh(domain).await.unwrap_or_default();
-            if resolved_ip.is_empty() {
-                ldebug!(" CF DNS {} -> no result", domain);
-                return (None, String::new(), Some(host_err));
-            }
-            ldebug!(" CF DNS {} -> {}", domain, resolved_ip);
-            let ip_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
-            match ws_connect_once(&resolved_ip, domain, path, ip_timeout, cf_use_tls()).await {
-                Ok(ws) => (Some(ws), resolved_ip, None),
-                Err(e) => (None, resolved_ip, Some(e)),
-            }
-        }
+    let host_err = match cf_dial_stage(name, domain, domain, path, phase_timeout).await {
+        CfDial::Connected(ws) => return CfConnect::Connected(ws, String::new()),
+        CfDial::Skipped => return CfConnect::Skipped,
+        CfDial::Failed(e) => e,
+    };
+    if is_http_status_error(&host_err, 429) {
+        return CfConnect::Failed(String::new(), host_err);
+    }
+    let resolved_ip = resolve_doh(domain).await.unwrap_or_default();
+    if resolved_ip.is_empty() {
+        ldebug!(" CF DNS {} -> no result", domain);
+        return CfConnect::Failed(String::new(), host_err);
+    }
+    ldebug!(" CF DNS {} -> {}", domain, resolved_ip);
+    match cf_dial_stage(name, &resolved_ip, domain, path, phase_timeout).await {
+        CfDial::Connected(ws) => CfConnect::Connected(ws, resolved_ip),
+        // Оба режима уже в cooldown после стадии по имени: ошибка та же.
+        CfDial::Skipped => CfConnect::Failed(String::new(), host_err),
+        CfDial::Failed(e) => CfConnect::Failed(resolved_ip, e),
     }
 }
 

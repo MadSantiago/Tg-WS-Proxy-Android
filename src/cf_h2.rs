@@ -2062,6 +2062,10 @@ impl PoolInner {
     /// прошедший preflight сохраняется.
     async fn setup(self: &Arc<Self>, dc: i32, domains: Vec<String>, generation: u64) -> bool {
         for base in domains {
+            // v1.12.0: TLS к этому CF-домену недавно завис — H2 не пробуем.
+            if crate::cf_websocket::cf_tls_in_cooldown(&base) {
+                continue;
+            }
             let host = format!("kws{}.{}", dc, base);
             if self.host_cooldowns.active(&host, Instant::now()) {
                 continue;
@@ -2164,6 +2168,9 @@ impl H2Pool {
             return Ok(None);
         }
         for base in &domains {
+            if crate::cf_websocket::cf_tls_in_cooldown(base) {
+                continue;
+            }
             let host = format!("kws{}.{}", dc, base);
             if inner.host_cooldowns.active(&host, now) {
                 continue;

@@ -75,6 +75,11 @@ pub const CF_WORKER_PER_DC_LIMIT: usize = 1;
 pub const CF_WORKER_POOL_CHECK_INTERVAL: f64 = 5.0;
 pub const CF_WORKER_REFILL_BACKOFF_INITIAL: f64 = 1.0;
 pub const CF_WORKER_REFILL_BACKOFF_MAX: f64 = 3600.0;
+/// Пауза домена воркера после 5xx/сетевой ошибки (десктоп 0970820,
+/// FAILURE_COOLDOWN). Дневной лимит (429) ставит паузу до полуночи UTC.
+pub const CF_WORKER_FAILURE_COOLDOWN: f64 = 60.0;
+/// Потолок попытки подключения к воркеру при пополнении пула (десктоп 8 с).
+pub const CF_WORKER_POOL_CONNECT_TIMEOUT: f64 = 8.0;
 // Android: ротация пула CF worker останавливается (и пул закрывается), если
 // пул этого DC не запрашивали дольше этого времени. Следующий get() запустит
 // её снова. На десктопе ротация живёт до остановки прокси.
