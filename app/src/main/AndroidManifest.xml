@@ -43,6 +43,7 @@
             android:name="com.amurcanov.tgwsproxy.MainActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize"
+            android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.TGWSPROXY">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

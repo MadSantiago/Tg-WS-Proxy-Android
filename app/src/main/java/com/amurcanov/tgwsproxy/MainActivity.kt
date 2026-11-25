@@ -192,8 +192,14 @@ fun MainContent(settingsStore: SettingsStore) {
         NavItem(stringResource(R.string.nav_logs), Icons.Default.Terminal),
         NavItem(stringResource(R.string.info), Icons.Default.Info)
     )
-    val safeBottomInset = with(density) { WindowInsets.safeDrawing.getBottom(density).toDp() }
-    val navOverlayReserve = safeBottomInset + 96.dp
+    // Навбар привязан только к системным панелям (жестовая/кнопочная навигация) и не
+    // зависит от клавиатуры: раньше safeDrawing включал IME, и навбар поднимался над
+    // клавиатурой на разную высоту. Клавиатура перекрывает навбар, а область контента
+    // сжимается до её верхней границы, чтобы поле ввода оставалось видимым.
+    val navBarBottomInset = with(density) { WindowInsets.navigationBars.getBottom(density).toDp() }
+    val imeBottomInset = with(density) { WindowInsets.ime.getBottom(density).toDp() }
+    val navOverlayReserve = navBarBottomInset + 96.dp
+    val contentBottomPadding = maxOf(navOverlayReserve, imeBottomInset)
 
     DisposableEffect(Unit) {
         LogManager.startListening()
@@ -298,7 +304,7 @@ fun MainContent(settingsStore: SettingsStore) {
                 },
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(bottom = navOverlayReserve),
+                    .padding(bottom = contentBottomPadding),
                 label = "tab_content"
             ) { page ->
                 when (page) {
@@ -396,7 +402,9 @@ private fun ProxyNavigationBar(
     val indicatorIndex = remember { Animatable(selectedTab.toFloat()) }
     val dragVisualIndex = indicatorIndex.value
 
-    LaunchedEffect(selectedTab) {
+    // Ключ dragTargetIndex: после короткого свайпа вкладка не меняется, но жест
+    // закончился, и плитка должна вернуться на выбранную вкладку.
+    LaunchedEffect(selectedTab, dragTargetIndex) {
         if (dragTargetIndex !in navItems.indices) {
             indicatorIndex.animateTo(
                 targetValue = selectedTab.toFloat(),
@@ -418,7 +426,7 @@ private fun ProxyNavigationBar(
     BoxWithConstraints(
         modifier = modifier
             .fillMaxWidth()
-            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom))
+            .windowInsetsPadding(WindowInsets.systemBars.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom))
             .padding(horizontal = 22.dp, vertical = 12.dp)
     ) {
         val trackPadding = 8.dp
