@@ -139,6 +139,10 @@
     <string name="notification_channel_description">Proxy server status notification</string>
     <string name="notification_restart">Restart</string>
     <string name="notification_disconnect">Disconnect</string>
+    <string name="notification_stopped">Proxy was stopped</string>
+    <string name="notification_stopped_details">Proxy was stopped: the system blocked background work. Tap Restart or remove battery restrictions for the app.</string>
+    <string name="notification_channel_stopped_name">Proxy stopped</string>
+    <string name="notification_channel_stopped_description">Notification shown when the system stopped the proxy</string>
     <string name="tile_connected">Connected</string>
     <string name="tile_disconnected">Disconnected</string>
     <string name="interval_7h">7 h</string>

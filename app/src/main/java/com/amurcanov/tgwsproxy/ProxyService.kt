@@ -68,7 +68,9 @@ class ProxyService : Service() {
         const val EXTRA_CF_WORKER_DOMAINS = "EXTRA_CF_WORKER_DOMAINS"
         
         private const val NOTIFICATION_ID = 101
+        private const val STOPPED_NOTIFICATION_ID = 102
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
+        private const val STOPPED_CHANNEL_ID = "TG_WS_Proxy_Stopped_v1"
         private const val TAG = "ProxyService"
 
         // Wakelock refresh interval (25 min, re-acquire before 30-min timeout)
@@ -93,6 +95,7 @@ class ProxyService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        var started = true
         when (intent?.action) {
             ACTION_START -> {
                 LogManager.clearLogs()
@@ -109,7 +112,7 @@ class ProxyService : Service() {
                 val tlsVerify = intent.getBooleanExtra(EXTRA_TLS_VERIFY, SettingsStore.DEFAULT_TLS_VERIFY)
                 val fakeTlsDomain = intent.getStringExtra(EXTRA_FAKE_TLS_DOMAIN) ?: ""
                 val cfWorkerDomains = intent.getStringExtra(EXTRA_CF_WORKER_DOMAINS) ?: ""
-                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey, disableSecure, cfH2Media, tlsVerify, fakeTlsDomain, cfWorkerDomains)
+                started = startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey, disableSecure, cfH2Media, tlsVerify, fakeTlsDomain, cfWorkerDomains)
             }
             ACTION_STOP -> {
                 stopProxy()
@@ -122,7 +125,7 @@ class ProxyService : Service() {
                 // If we had saved params, try to restart
                 if (lastPort > 0 && lastSecretKey.isNotEmpty()) {
                     Log.w(TAG, "Service restarted by system, re-starting proxy")
-                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey, lastDisableSecure, lastCfH2Media, lastTlsVerify, lastFakeTlsDomain, lastCfWorkerDomains)
+                    started = startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey, lastDisableSecure, lastCfH2Media, lastTlsVerify, lastFakeTlsDomain, lastCfWorkerDomains)
                 } else {
                     stopSelf()
                 }
@@ -130,7 +133,9 @@ class ProxyService : Service() {
         }
         // START_REDELIVER_INTENT: if the system kills the service, it will restart it
         // and re-deliver the last intent, so we don't lose the config.
-        return START_REDELIVER_INTENT
+        // If startForeground() was rejected, the service has already stopped itself and shown
+        // the "proxy was stopped" notification; don't ask the system to redeliver the intent.
+        return if (started) START_REDELIVER_INTENT else START_NOT_STICKY
     }
 
     private fun isPortAvailable(bindIp: String, port: Int): Boolean {
@@ -154,8 +159,8 @@ class ProxyService : Service() {
                            cfH2Media: Boolean = SettingsStore.DEFAULT_CF_H2_MEDIA,
                            tlsVerify: Boolean = SettingsStore.DEFAULT_TLS_VERIFY,
                            fakeTlsDomain: String = "",
-                           cfWorkerDomains: String = "") {
-        if (_isRunning.value || stopInProgress) return
+                           cfWorkerDomains: String = ""): Boolean {
+        if (_isRunning.value || stopInProgress) return true
         _isVerifiedRunning.value = false
 
         // Save params for restart
@@ -177,15 +182,26 @@ class ProxyService : Service() {
         lastNotificationAtMs = notificationStartedAtMs
 
         val notification = createNotification(lastNotificationContent)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            // Android 12+: ForegroundServiceStartNotAllowedException when the service is
+            // (re)started by the system while the app is in the background and not exempt
+            // from battery restrictions. ForegroundServiceStartNotAllowedException is API 31+,
+            // so catch Exception to stay safe on minSdk 21/24.
+            Log.e(TAG, "startForeground() rejected, proxy was not started", e)
+            onForegroundStartDenied()
+            return false
         }
+        cancelStoppedNotification()
 
         acquireWakeLock()
         stopInProgress = false
@@ -277,6 +293,98 @@ class ProxyService : Service() {
                     }
                 }
             }
+        }
+        return true
+    }
+
+    /**
+     * The system refused to promote the service to foreground. The proxy never started,
+     * so tell the user and let them restart it (a notification action is an exempt
+     * entry point for starting a foreground service on Android 12+).
+     */
+    private fun onForegroundStartDenied() {
+        updateRunningState(false)
+        showStoppedNotification()
+        stopSelf()
+    }
+
+    private fun buildStartIntent(): Intent =
+        Intent(this, ProxyService::class.java).apply {
+            action = ACTION_START
+            putExtra(EXTRA_BIND_IP, lastBindIp)
+            putExtra(EXTRA_PORT, lastPort)
+            putExtra(EXTRA_IPS, lastIps)
+            putExtra(EXTRA_POOL_SIZE, lastPoolSize)
+            putExtra(EXTRA_CFPROXY_ENABLED, lastCfEnabled)
+            putExtra(EXTRA_CFPROXY_PRIORITY, lastCfPriority)
+            putExtra(EXTRA_CFPROXY_DOMAIN, lastCfDomain)
+            putExtra(EXTRA_SECRET_KEY, lastSecretKey)
+            putExtra(EXTRA_DISABLE_SECURE, lastDisableSecure)
+            putExtra(EXTRA_CF_H2_MEDIA, lastCfH2Media)
+            putExtra(EXTRA_TLS_VERIFY, lastTlsVerify)
+            putExtra(EXTRA_FAKE_TLS_DOMAIN, lastFakeTlsDomain)
+            putExtra(EXTRA_CF_WORKER_DOMAINS, lastCfWorkerDomains)
+        }
+
+    private fun showStoppedNotification() {
+        try {
+            val openPendingIntent = PendingIntent.getActivity(
+                this, 1,
+                Intent(this, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            // The process may have been recreated (no saved state in memory besides this
+            // intent), so "Restart" carries the full START config instead of ACTION_RESTART.
+            val startIntent = buildStartIntent()
+            val restartPendingIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                PendingIntent.getForegroundService(
+                    this, 3, startIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            } else {
+                PendingIntent.getService(
+                    this, 3, startIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            }
+
+            val notification = NotificationCompat.Builder(this, STOPPED_CHANNEL_ID)
+                .setContentTitle("Telegram WS Proxy")
+                .setContentText(getString(R.string.notification_stopped))
+                .setStyle(
+                    NotificationCompat.BigTextStyle()
+                        .bigText(getString(R.string.notification_stopped_details))
+                )
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentIntent(openPendingIntent)
+                .addAction(
+                    android.R.drawable.ic_popup_sync,
+                    getString(R.string.notification_restart),
+                    restartPendingIntent
+                )
+                .setOngoing(false)
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .build()
+
+            (getSystemService(NOTIFICATION_SERVICE) as? NotificationManager)
+                ?.notify(STOPPED_NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to show stopped notification", e)
+        }
+    }
+
+    private fun cancelStoppedNotification() {
+        try {
+            (getSystemService(NOTIFICATION_SERVICE) as? NotificationManager)
+                ?.cancel(STOPPED_NOTIFICATION_ID)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to cancel stopped notification", e)
         }
     }
 
@@ -499,6 +607,20 @@ class ProxyService : Service() {
             }
             val manager = getSystemService(NOTIFICATION_SERVICE) as? NotificationManager
             manager?.createNotificationChannel(serviceChannel)
+
+            val stoppedChannel = NotificationChannel(
+                STOPPED_CHANNEL_ID,
+                getString(R.string.notification_channel_stopped_name),
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = getString(R.string.notification_channel_stopped_description)
+                setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
+                enableLights(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            }
+            manager?.createNotificationChannel(stoppedChannel)
         }
     }
 
