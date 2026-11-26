@@ -1,4 +1,4 @@
-# Локальный референс-оригинал (не коммитим)
+﻿# Локальный референс-оригинал (не коммитим)
 tg-ws-proxy-main/
 
 # Gradle / Android build outputs
@@ -34,3 +34,8 @@ target/
 .vscode/
 .DS_Store
 Thumbs.db
+
+patches/
+old_patches/
+demo.jpg
+*.patch
